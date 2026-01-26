@@ -101,4 +101,5 @@ An automated RCON management system for Movie Battles II (Jedi Academy). This pl
 * **Python 3.x**
 * **SQLite3**
 * **Movie Battles II Server** with RCON and logging enabled.
-* **Works with [mbiided with Duel Isolation](https://github.com/Wookiee-/MB2OpenJK/releases/tag/R21)
+*  **Works with [mbiided with Duel Isolation](https://github.com/Wookiee-/MB2OpenJK/releases/tag/R21)**
+
