@@ -185,10 +185,15 @@ class MBIIDuelPlugin:
             self.send_rcon(f'say "^5[DUEL] ^2{p.name} ^7is ready to resume!"')
         
         if cmd[0] == "!dhelp":
-            help_msg = "^5Commands: ^7!rank !dtop, !dclantop, !dduel <name>, !dclantag register <tag>, !dclan show, !dclan join group <name>"
+            # Line 1: General & Duel
+            line1 = "^5Duel: ^7!rank [name], !dtop, !fttop, !ttop, !dduel <name> <rounds>, !dforfeit, !dpause, !dresume"
+            self.send_rcon(f'svtell {p.id} "{line1}"')
+            
+            # Line 2: Clan Management
+            line2 = "^5Clan: ^7!dclantag register <tag>, !dclan show, !dclan join group <name>, !dclan quit"
             if p.role in ["OFFICER", "LEADER", "OWNER"]:
-                help_msg += " ^3Staff: ^7!tstart, !dclan lock/rename/kick"
-            self.send_rcon(f'svtell {p.id} "{help_msg}"')
+                line2 += " ^3Staff: ^7!tstart, !dclan promote/kick/rename/lock"
+            self.send_rcon(f'svtell {p.id} "{line2}"')
 
         if cmd[0] == "!dclantag":
             if len(cmd) < 3: return
@@ -312,8 +317,7 @@ class MBIIDuelPlugin:
                 self.send_rcon(f'svtell {target_p.id} "^1[CLAN] ^7Your group request was declined."')
 
         elif cmd[0] == "!thelp":
-            # Basic commands available to all players during a tournament lobby or match
-            t_msg = "^5Tournament Commands: ^7!tyes (Join), !tforfeit (Surrender), !thelp"
+            t_msg = "^5[TOURNAMENT]: ^7!tyes (Join Lobby), !tforfeit (Surrender Match), !thelp"
             
             # Additional commands visible only to staff (OFFICER and above)
             if p.role != "MEMBER":
@@ -371,15 +375,32 @@ class MBIIDuelPlugin:
             self.send_rcon(f'say "^5[FORFEIT] ^2{p.name} ^7surrendered to ^2{winner.name}^7."')
             self.finalize_match(winner, p)
         elif cmd[0] == "!dduel":
-            if len(cmd) < 2: return
-            rounds = int(cmd[-1]) if cmd[-1].isdigit() else 5
-            target_search = " ".join(cmd[1:-1]) if cmd[-1].isdigit() else " ".join(cmd[1:])
-            target = next((x for x in self.players if target_search.lower() in x.clean_name), None)
-            if target and target != p:
-                target.pending_invite_from = p
-                target.pending_limit = rounds
-                self.send_rcon(f'say "^5[CHALLENGE] ^2{p.name} ^7challenged ^2{target.name} ^7to First to ^3{rounds}^7!"')
-                self.send_rcon(f'svtell {target.id} "^7Type ^2!dyes ^7or ^1!dno"')
+            # Usage: !dduel <name> <rounds>
+            if len(cmd) < 3:
+                return self.send_rcon(f'svtell {p.id} "^1Usage: ^7!dduel <name> <rounds>"')
+
+            try:
+                # The last argument is the rounds
+                rounds = int(cmd[-1])
+                # Everything between the command and the rounds is the name (handles spaces)
+                target_search = " ".join(cmd[1:-1]).lower()
+            except ValueError:
+                return self.send_rcon(f'svtell {p.id} "^1Error: ^7Rounds must be a number. Example: !dduel Valzhar 10"')
+
+            target = next((x for x in self.players if target_search in x.clean_name), None)
+            
+            if not target:
+                return self.send_rcon(f'svtell {p.id} "^1Error: ^7Player \'{target_search}\' not found."')
+                
+            if target == p:
+                return self.send_rcon(f'svtell {p.id} "^1Error: ^7You cannot duel yourself."')
+
+            # Set challenge state
+            target.pending_invite_from = p
+            target.pending_limit = rounds
+            
+            self.send_rcon(f'say "^5[CHALLENGE] ^2{p.name} ^7challenged ^2{target.name} ^7to First to ^3{rounds}^7!"')
+            self.send_rcon(f'svtell {target.id} "^7Type ^2!dyes ^7or ^1!dno ^7to respond."')
 
         elif cmd[0] == "!dyes" and p.pending_invite_from:
             inviter = p.pending_invite_from
@@ -505,7 +526,14 @@ class MBIIDuelPlugin:
                             self.send_rcon('say "^5[SYSTEM] ^7Map/Round change detected. Restoring states..."')
                             # Clear temporary local lists but keep the database-backed players
                             self.lobby_players = []
-                            self.active_tournament = False                        
+                            self.active_tournament = False
+
+                        elif "ClientUserinfoChanged:" in line:
+                            m = re.search(r'ClientUserinfoChanged:\s*(\d+)\s*n\\([^\\]+)', line)
+                            if m:
+                                sid, name = int(m.group(1)), m.group(2)
+                                # This ensures the player exists in memory before they even try to chat
+                                self.sync_player(sid, name)                          
                         # ADMIN OPS
                         if "SMOD smsay:" in line:
                             smod_match = re.search(r'SMOD smsay:\s+(.*?)\s+\(adminID:\s+(\d+)\).*?\):\s*(.*)$', line)
@@ -544,6 +572,68 @@ class MBIIDuelPlugin:
                         if m_chat:
                             p = next((x for x in self.players if x.id == int(m_chat.group(1))), None)
                             if p: self.handle_chat(p, "!" + m_chat.group(2))
+
+
+                        if "say:" in line.lower():
+                            try:
+                                # 1. Extract mashed SID (e.g., "314: say:" -> 4)
+                                log_sid = -1
+                                sid_match = re.search(r'(\d+)[:\s]*say:', line, re.IGNORECASE)
+                                if sid_match:
+                                    sid_str = sid_match.group(1)
+                                    # Skip first 2 digits if length > 2 (Time+ID), else use as-is
+                                    log_sid = int(sid_str[2:]) if len(sid_str) > 2 else int(sid_str)
+
+                                # 2. Extract Name and Message: say: Name: "Message"
+                                msg_match = re.search(r'say:\s*(.*?):\s*"(.*)"', line)
+                                if msg_match:
+                                    raw_name = msg_match.group(1)
+                                    message = msg_match.group(2).strip()
+                                    # Normalize name for lookup
+                                    clean_name_raw = re.sub(r'\^.', '', raw_name).strip().lower()
+
+                                    # 3. Find Player: Try ID first, then fallback to Name matching
+                                    p = next((x for x in self.players if x.id == log_sid), None)
+                                    if not p:
+                                        p = next((x for x in self.players if x.clean_name == clean_name_raw), None)
+
+                                    if p:
+                                        # Synchronize ID if it was mashed/shifted
+                                        p.id = log_sid 
+                                        self.handle_chat(p, message)
+                                    else:
+                                        # Final Fail-safe: If unknown, create temp player to allow commands
+                                        p_temp = Player(log_sid, raw_name, "0")
+                                        self.handle_chat(p_temp, message)
+                            except Exception as e:
+                                print(f"[PARSER ERROR] Say line failed: {e}")
+
+                        elif "tell:" in line.lower():
+                            try:
+                                # 1. Extract SID from tell (e.g., "140 tell: ...")
+                                sid_match = re.search(r'(\d+)\s*tell:', line, re.IGNORECASE)
+                                if sid_match:
+                                    sid_str = sid_match.group(1)
+                                    log_sid = int(sid_str[2:]) if len(sid_str) > 2 else int(sid_str[-1])
+                                    
+                                    # 2. Extract Message
+                                    msg_match = re.search(r'tell:.*?: "(.*)"', line)
+                                    if msg_match:
+                                        message = msg_match.group(1).strip()
+                                        
+                                        # 3. Find Player: ID then Name fallback
+                                        p = next((x for x in self.players if x.id == log_sid), None)
+                                        if not p:
+                                            name_match = re.search(r'tell:\s*(.*?)\s+to', line)
+                                            if name_match:
+                                                raw_n = name_match.group(1).strip().lower()
+                                                p = next((x for x in self.players if x.clean_name == raw_n), None)
+                                        
+                                        if p:
+                                            self.handle_chat(p, message)
+                            except Exception as e:
+                                print(f"[PARSER ERROR] Tell line failed: {e}")
+                                                
                 last_sz = curr_sz
             time.sleep(0.2)
 
@@ -597,7 +687,7 @@ class MBIIDuelPlugin:
             print(f"RCON Error: {e}")
 
 if __name__ == "__main__":
-    
+
     while True:
         try:
             # Initialize and run the plugin

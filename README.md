@@ -6,8 +6,6 @@
 
 An automated RCON management system for **Movie Battles II** (Jedi Academy). This plugin provides a comprehensive competitive framework featuring Glicko-2 skill ratings, automated tournaments, and a persistent hierarchical clan system using real-time log tailing and SQLite.
 
-
-
 ---
 
 ## 🚀 Key Features
@@ -22,8 +20,6 @@ An automated RCON management system for **Movie Battles II** (Jedi Academy). Thi
 * **Squad Management**: Allows clans to be organized into subdivisions (e.g., "Alpha Squad") with independent "Locked" or "Open" join statuses.
 * **Staff Controls**: Automated rank checks prevent `MEMBER` rank players from initiating `!tstart` or administrative functions.
 
-
-
 ### 3. Competitive Systems & Rating
 * **Glicko-2 Rating Algorithm**: Dynamic skill calculation based on opponent strength and rating deviation.
 * **Automated Match Detection**: Monitors logs for private duels to award rating points and update leaderboards automatically.
@@ -34,6 +30,11 @@ An automated RCON management system for **Movie Battles II** (Jedi Academy). Thi
 * **!rank**: Provides a comprehensive personal summary of Rating, Total Rounds Won, and Tournament Wins.
 * **Individual Top 5**: Dedicated leaderboards for rating (`!dtop`), rounds won (`!fttop`), and tourney wins (`!ttop`).
 * **Clan Rankings**: Displays the top clans based on the average Glicko-2 rating of all active members (`!dclantop`).
+
+### 🛡️ Robust Chat Parsing
+* **SID De-mashing**: Automatically handles Jedi Academy's log behavior where timestamps and player IDs are concatenated (e.g., `314: say:`).
+* **Double-Lookup Strategy**: Uses a primary Server ID check with a secondary normalized Name-Search fallback to ensure commands never fail due to color codes or hidden characters.
+* **Fail-safe Execution**: Unknown players are automatically assigned temporary session profiles so they can still access help commands and leaderboard lookups.
 
 ---
 
