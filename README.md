@@ -52,21 +52,22 @@ An automated RCON management system for **Movie Battles II** (Jedi Academy). Thi
 
 ---
 
-## 👑 Staff & Admin Commands
+### 🛡️ Admin & Staff Operations (SMOD)
+*These commands are sent via admin chat or svtell and bypass standard player restrictions to maintain server order.*
 
-### Clan Staff Commands
-*Requires **OFFICER** rank or higher.*
-* `!tstart <score>`: Starts a tournament lobby (Restricted to Staff).
-* `!dclan promote <name>`: Increases a member's rank.
-* `!dclan kick <name>`: Removes a player from the clan.
-* `!dclan lock <group>`: Toggles a group between Open and Invite-Only.
+#### 👑 Senior Admin Commands (SMOD)
+* **`!clan <name> <TAG>`**: Overrides a player's current clan affiliation and updates the database.
+* **`!group <name> <group>`**: Force-assigns a player to a specific squad or subdivision (e.g., ALPHA).
+* **`!promote <name>`**: Instantly advances a player to the **OWNER** rank within their registered clan.
+* **`!resetplayer <name>`**: Completely wipes a player's Glicko-2 ratings, round history, and tournament wins from the database.
 
-### SMOD Admin Commands
-*Sent via admin chat. Bypasses all restrictions.*
-* `!group <name> <group>`: Force-moves a player into a specific squad.
-* `!clan <name> <TAG>`: Force-sets a player's clan affiliation.
-* `!promote <name>`: Force-promotes any player to **OWNER**.
-* `!resetplayer <name>`: Wipes all Glicko stats and tournament wins.
+#### ⚔️ Tournament & Match Control
+* **`!cstart`**: Manually initializes the competitive match state tracker.
+* **`!tstart <score>`**: Opens a tournament lobby; defaults to First to 5 if no score is specified.
+* **`!tpause` / `!tresume`**: Globally halts or resumes all active tournament matches—useful for server-wide timeouts or technical issues.
+
+#### 💬 Admin Intelligence
+* **`!admin_ops`**: Displays a private summary of all high-level administrative commands to the caller's console.
 
 ---
 
