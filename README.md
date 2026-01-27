@@ -95,7 +95,9 @@ The repository includes management scripts to run the plugin in the background o
 ### 🐧 Linux Setup
 1. Give the script execution permissions:
    ```bash
-   chmod +x start_duel.sh start | stop | restart | status
+   chmod +x start_duel.sh 
+
+   ./start_duel.sh start | stop | restart | status
     ```
 
 ---
