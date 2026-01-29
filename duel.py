@@ -813,10 +813,9 @@ class MBIIDuelPlugin:
 
     def run(self):
         log = self.settings['logname']
+        # Initialize bookmark at the current end to skip old duplicates on restart
         last_sz = os.path.getsize(log) if os.path.exists(log) else 0
-        print(f"[SYSTEM] Plugin active. Monitoring {log}")
-
-        self.is_catching_up = True 
+        print(f"[SYSTEM] Plugin active. Monitoring {log} (Gate Method Active)")
 
         while True:
             try:
@@ -826,294 +825,276 @@ class MBIIDuelPlugin:
 
                 curr_sz = os.path.getsize(log)
                 if curr_sz < last_sz:
-                    last_sz = 0
+                    last_sz = 0 # Handle log rotation
 
                 if curr_sz > last_sz:
                     with open(log, 'r', encoding='utf-8', errors='ignore') as f:
                         f.seek(last_sz)
-                        # 1. Read everything into a list so we can close the file safely
                         lines = f.readlines()
-                        # 2. Update bookmark immediately after reading
                         last_sz = f.tell()
 
-                    # 3. Process the lines using the LIST, not the file handle 'f'
-                    for line in lines:
-                        line = line.strip()
-                        if not line: continue
+                        for line in lines:
+                            line = line.strip()
+                            if not line: continue
+                            # This calls the standalone method below
+                            self.parse_line(line)
 
-                        if "InitGame:" in line:
-                            # self.send_rcon('say "^5[SYSTEM] ^7Map/Round change detected. Restoring states..."')
-                            # Clear temporary lobby lists
-                            self.lobby_players = []
-                            self.active_tournament = False
-                            self.players = []
-                            self.slot_map = {}
-                            self.active_duels = set()
-                            # CRITICAL: Ask the server who is here immediately
-                            self.send_rcon("status")
-                            
-                            # CRITICAL: Re-sync players so the script knows who is in which slot
-                            # This calls the status command to rebuild self.players and self.slot_map
-                            threading.Timer(2.0, self.force_sync_players).start()
-                            continue
-
-                        # --- THE SWITCHBOARD (Keep this updated!) ---
-                        m_info = re.search(r'ClientUserinfoChanged: (\d+) n\\(.*?)\\t\\', line)
-                        if m_info:
-                            slot_id = int(m_info.group(1))
-                            full_name = m_info.group(2).strip()
-                            
-                            # 1. Sync returns the player object and handles DB updates
-                            p = self.sync_player(slot_id, full_name, "0") 
-                            
-                            # 2. Update the Slot Map (Crucial for !dduel and ID-based lookups)
-                            self.slot_map[slot_id] = p 
-                            
-                            # 3. List Integrity: Ensure this player object is the ONLY one in self.players for this slot
-                            self.players = [player for player in self.players if player.id != slot_id]
-                            self.players.append(p)
-                            
-                            print(f"[DEBUG] Slot {slot_id} is now mapped to {p.clean_name}")
-                            continue
-
-                        # Capture GUIDs (Player 0: zaanne ja_guid\ABC...)
-                        m_spawn = re.search(r'(?:Player|ClientInfo)\s+(\d+).*?ja_guid\\([A-Z0-9]{32})', line)
-                        if m_spawn:
-                            sid = int(m_spawn.group(1))
-                            guid = m_spawn.group(2)
-                            for p in self.players:
-                                if p.guid == guid:
-                                    p.id = sid  
-                                    self.slot_map[sid] = p # PLUG INTO SWITCHBOARD
-                                    break
-
-                        # 3. DUEL LOGIC (Start)
-                        m_start = re.search(r'DuelStart: (.*?) challenged (.*?) to a private duel', line)
-                        if m_start:
-                            raw_p1 = m_start.group(1).strip()
-                            raw_p2 = m_start.group(2).strip()
-                            
-                            p1 = next((x for x in self.players if x.clean_name == normalize(raw_p1)), None)
-                            p2 = next((x for x in self.players if x.clean_name == normalize(raw_p2)), None)
-
-                            if not p1: p1 = self.sync_player(-1, raw_p1, "0")
-                            if not p2: p2 = self.sync_player(-1, raw_p2, "0")
-
-                            if p1 and p2:
-                                # --- THE ANTI-DUPLICATE GATE ---
-                                duel_key = tuple(sorted([p1.clean_name, p2.clean_name]))
-                                current_time = time.time()
-                                
-                                # Check if this specific pair was announced in the last 5 seconds
-                                last_time = getattr(self, 'last_announcement_time', {})
-                                pair_last = last_time.get(duel_key, 0)
-                                
-                                if (current_time - pair_last) < 5.0:
-                                    continue # It's a duplicate log line, SKIP IT
-                                
-                                # Update the global announcement tracker
-                                last_time[duel_key] = current_time
-                                self.last_announcement_time = last_time
-                                # -------------------------------
-
-                                # Register the duel in memory for the m_end block
-                                self.active_duels.add(duel_key)
-                                
-                                if not self.is_catching_up:
-                                    # Use the dynamic limit from the !dduel command
-                                    limit = getattr(p1, 'pending_limit', 5)
-                                    
-                                    if p1.opponent == p2 and p1.match_score == 0 and p2.match_score == 0:
-                                        self.send_rcon(f'say "^5[MATCH] ^2{p1.clean_name} ^7vs ^2{p2.clean_name} ^7- First to ^3{limit} ^7starts NOW!"')
-                                    else:
-                                        self.send_rcon(f'say "^5[DUEL] ^7Challenge: ^2{p1.clean_name} ^7(^5{int(p1.rating)}^7) vs ^2{p2.clean_name} ^7(^5{int(p2.rating)}^7)"')
-                            
-                            continue
-
-                        # 4. DUEL LOGIC (End)
-                        m_end = re.search(r'DuelEnd:\s+(.*?)\s+has defeated\s+(.*?)\s+in a private duel', line, re.IGNORECASE)
-                        if m_end:
-                            try:
-                                raw_w, raw_l = m_end.group(1).strip(), m_end.group(2).strip()
-                                winner = next((x for x in self.players if x.clean_name == normalize(raw_w)), None)
-                                loser = next((x for x in self.players if x.clean_name == normalize(raw_l)), None)
-
-                                if winner and loser:
-                                    # 1. CREATE THE UNIQUE PAIR KEY
-                                    duel_key = tuple(sorted([winner.clean_name, loser.clean_name]))
-                                    
-                                    # 2. CHECK ACTIVE LOCK: If duel wasn't registered, ignore it
-                                    if duel_key not in self.active_duels:
-                                        continue
-
-                                    # 3. CHECK PAIR-SPECIFIC COOLDOWN: Uses your new dictionary
-                                    current_time = time.time()
-                                    pair_last = self.last_announcement_time.get(duel_key, 0)
-                                    
-                                    if (current_time - pair_last) < 3.0:
-                                        continue # Skip duplicate log lines
-                                    
-                                    # 4. UPDATE THE GATE: Lock this specific pair immediately
-                                    self.last_announcement_time[duel_key] = current_time
-                                    
-                                    # 5. REMOVE FROM ACTIVE: This is the primary protection
-                                    self.active_duels.discard(duel_key)
-                                    
-                                    # --- PROCESS ACTUAL RESULTS ---
-                                    self.calculate_glicko2(winner, loser)
-
-                                    if winner.opponent == loser:
-                                        winner.match_score += 1
-                                        current_limit = getattr(winner, 'pending_limit', 5)
-                                        
-                                        with sqlite3.connect(self.db_filename) as conn:
-                                            w_f = 'guid' if (winner.guid and len(winner.guid) > 10) else 'clean_name'
-                                            l_f = 'guid' if (loser.guid and len(loser.guid) > 10) else 'clean_name'
-                                            conn.execute(f"UPDATE players SET total_rounds_won = total_rounds_won + 1 WHERE {w_f}=?", (winner.guid if 'guid' in w_f else winner.clean_name,))
-                                            conn.execute(f"UPDATE players SET total_rounds_lost = total_rounds_lost + 1 WHERE {l_f}=?", (loser.guid if 'guid' in l_f else loser.clean_name,))
-                                            conn.commit()
-
-                                        self.save_match_progress(winner, loser)
-                                        if not self.is_catching_up:
-                                            self.send_rcon(f'say "^5[MATCH] ^2{winner.clean_name} ^7({winner.match_score}/{current_limit}) vs ^2{loser.clean_name} ^7({loser.match_score}/{current_limit})" ')
-                                        
-                                        if winner.match_score >= current_limit:
-                                            self.finalize_match(winner, loser)
-                                        continue 
-                                    
-                                    if not self.is_catching_up:
-                                        self.send_rcon(f'say "^5[DUEL] ^2{winner.clean_name} ^7wins! ^2{int(winner.rating)} ^7| ^2{loser.clean_name} ^7dropped to ^1{int(loser.rating)}"')
-                                        
-                            except Exception as e:
-                                print(f"[PARSER ERROR] m_end failed: {e}")
-                            continue
-                            
-                            continue
-
-                        # 5. DISCONNECT CLEANUP (Removed 'entered the game')
-                        elif "ClientDisconnect:" in line:
-                            m = re.search(r'ClientDisconnect:\s*(\d+)', line)
-                            if m:
-                                t_sid = int(m.group(1)) # Group 1 because the regex is now simpler
-                                t_p = next((x for x in self.players if x.id == t_sid), None)
-                                
-                                if t_p:
-                                    # --- THE FORFEIT LOGIC ---
-                                    if t_p.opponent:
-                                        opp = t_p.opponent
-                                        if not self.is_catching_up:
-                                            self.send_rcon(f'say "^5[MATCH] ^2{opp.name} ^7wins! ^2{t_p.name} ^7left the server."')
-                                        opp.opponent = None
-                                        opp.match_score = 0
-
-                                    # --- CLEAR ACTIVE DUEL GATE ---
-                                    # Use a set comprehension to filter out the leaving player's name
-                                    self.active_duels = {key for key in self.active_duels if t_p.clean_name not in key}
-                                    
-                                    # --- SESSION REMOVAL ---
-                                    # This ensures that if they rejoin, sync_player creates a fresh object
-                                    self.players = [p for p in self.players if p.id != t_sid]  
-
-                        # --- SMOD ADMIN PARSER ---
-                        if "SMOD smsay:" in line:
-                            # DEBUG 1: Verify the script picked up the SMOD trigger
-                            # print(f"[DEBUG] SMOD line detected: {line.strip()}") 
-
-                            # Regex tailored to your debug log: handles the "):" without a space
-                            smod_match = re.search(r'SMOD smsay:\s+(.*?)\s+\(adminID:\s+(\d+)\).*?\):\s*(.*)$', line)
-                            
-                            if smod_match:
-                                admin_raw_name = smod_match.group(1).strip()
-                                admin_id = smod_match.group(2)
-                                full_message = smod_match.group(3).strip()
-                                
-                                # DEBUG 2: Verify the regex captured the correct groups
-                                # print(f"[DEBUG] Regex Match Success! Admin: {admin_raw_name}, ID: {admin_id}, Msg: {full_message}")
-                                
-                                self.handle_smod_command(admin_raw_name, admin_id, full_message)
-                            else:
-                                # DEBUG 3: If the line was seen but regex failed
-                                # print(f"[DEBUG] Regex FAILED to match SMOD line format.")
-                                pass
-
-                        # --- GLOBAL CHAT BLOCK ---
-                        elif "say:" in line.lower():
-                            # FIX 1: Bot Filter (Stops bot from reading its own [DUEL] announcements)
-                            if any(x in line for x in ["[DUEL]", "[DB]", "[MATCH]"]):
-                                continue
-                            try:
-                                # 1. Extract raw SID string
-                                sid_match = re.search(r'(\d+)[:\s]*say:', line, re.IGNORECASE)
-                                msg_match = re.search(r'say:\s*(.*?):\s*"(.*)"', line)
-                                
-                                if sid_match and msg_match:
-                                    sid_str = sid_match.group(1)
-                                    raw_name = msg_match.group(1)
-                                    message = msg_match.group(2).strip()
-
-                                    # FIX 2: Safe SID conversion (Prevents 'CB|Rogue' crash)
-                                    try:
-                                        log_sid = self.update_player_slot(sid_str, raw_name)
-                                    except (ValueError, TypeError):
-                                        # If regex slips and grabs a name instead of ID, ignore this line
-                                        continue
-
-                                    # 3. Use 'is not None' to allow Slot 0
-                                    p = next((x for x in self.players if x.id == log_sid), None)
-                                    
-                                    if p is not None:
-                                        p.id = log_sid # Sync mashed ID to clean ID
-                                        self.handle_chat(p, message)
-                                    else:
-                                        # Fallback for sync failures (Ghost Player)
-                                        p_temp = Player(log_sid, raw_name, "0")
-                                        self.handle_chat(p_temp, message)
-                            except Exception as e:
-                                print(f"[PARSER ERROR] Say line failed: {e}")
-
-                        # --- PRIVATE MESSAGE (TELL) BLOCK ---
-                        elif "tell:" in line.lower():
-                            try:
-                                sid_match = re.search(r'(\d+)\s*tell:', line, re.IGNORECASE)
-                                # Captures the sender name and the message
-                                msg_match = re.search(r'tell:\s*(.*?)\s+to\s+.*?:\s*"(.*)"', line)
-                                
-                                if sid_match and msg_match:
-                                    sid_str = sid_match.group(1)
-                                    raw_sender = msg_match.group(1).strip()
-                                    message = msg_match.group(2).strip()
-
-                                    # FIX 3: Safe SID conversion for Tells
-                                    try:
-                                        log_sid = self.update_player_slot(sid_str, raw_sender)
-                                    except (ValueError, TypeError):
-                                        continue
-
-                                    p = next((x for x in self.players if x.id == log_sid), None)
-                                    
-                                    # Safe fallback for Slot 0
-                                    if p is None:
-                                        clean_n = normalize(raw_sender) # Ensure normalize is available
-                                        p = next((x for x in self.players if x.clean_name == clean_n), None)
-
-                                    if p is not None:
-                                        p.id = log_sid
-                                        self.handle_chat(p, message)
-                                    else:
-                                        p_temp = Player(log_sid, raw_sender, "0")
-                                        self.handle_chat(p_temp, message)
-                            except Exception as e:
-                                print(f"[PARSER ERROR] Tell line failed: {e}")
-
-                    if self.is_catching_up:
-                        self.is_catching_up = False
-                        print("[SYSTEM] Catch-up complete. Live monitoring enabled.")
-
-
+                time.sleep(0.1)
             except Exception as e:
                 print(f"[CRITICAL ERROR] Loop failure: {e}")
+                time.sleep(2)                         
 
-            time.sleep(0.1)
+    def parse_line(self, line):    
+
+        if "InitGame:" in line:
+            # self.send_rcon('say "^5[SYSTEM] ^7Map/Round change detected. Restoring states..."')
+            # Clear temporary lobby lists
+            self.lobby_players = []
+            self.active_tournament = False
+            self.players = []
+            self.slot_map = {}
+            self.active_duels = set()
+            # CRITICAL: Ask the server who is here immediately
+            self.send_rcon("status")
+            
+            # CRITICAL: Re-sync players so the script knows who is in which slot
+            # This calls the status command to rebuild self.players and self.slot_map
+            threading.Timer(2.0, self.force_sync_players).start()
+            return
+
+        # --- THE SWITCHBOARD (Keep this updated!) ---
+        m_info = re.search(r'ClientUserinfoChanged: (\d+) n\\(.*?)\\t\\', line)
+        if m_info:
+            slot_id = int(m_info.group(1))
+            full_name = m_info.group(2).strip()
+            
+            # 1. Sync returns the player object and handles DB updates
+            p = self.sync_player(slot_id, full_name, "0") 
+            
+            # 2. Update the Slot Map (Crucial for !dduel and ID-based lookups)
+            self.slot_map[slot_id] = p 
+            
+            # 3. List Integrity: Ensure this player object is the ONLY one in self.players for this slot
+            self.players = [player for player in self.players if player.id != slot_id]
+            self.players.append(p)
+            
+            print(f"[DEBUG] Slot {slot_id} is now mapped to {p.clean_name}")
+            return
+
+        # Capture GUIDs (Player 0: zaanne ja_guid\ABC...)
+        m_spawn = re.search(r'(?:Player|ClientInfo)\s+(\d+).*?ja_guid\\([A-Z0-9]{32})', line)
+        if m_spawn:
+            sid = int(m_spawn.group(1))
+            guid = m_spawn.group(2)
+            for p in self.players:
+                if p.guid == guid:
+                    p.id = sid  
+                    self.slot_map[sid] = p # PLUG INTO SWITCHBOARD
+                    break
+
+        # 3. DUEL LOGIC (Start)
+        m_start = re.search(r'DuelStart: (.*?) challenged (.*?) to a private duel', line)
+        if m_start:
+            raw_p1 = m_start.group(1).strip()
+            raw_p2 = m_start.group(2).strip()
+            
+            p1 = next((x for x in self.players if x.clean_name == normalize(raw_p1)), None)
+            p2 = next((x for x in self.players if x.clean_name == normalize(raw_p2)), None)
+
+            # Fallback: Create player object if they aren't in memory
+            if not p1: p1 = self.sync_player(-1, raw_p1, "0")
+            if not p2: p2 = self.sync_player(-1, raw_p2, "0")
+
+            if p1 and p2:
+                # Create a unique key for this pair (alphabetical order)
+                duel_key = tuple(sorted([p1.clean_name, p2.clean_name]))
+                
+                # GATE: If this pair is already marked active, ignore duplicate logs
+                if duel_key in self.active_duels:
+                    return
+                
+                # Register the duel as active
+                self.active_duels.add(duel_key)
+
+                # Announce the match
+                limit = getattr(p1, 'pending_limit', 5)
+                if p1.opponent == p2 and p1.match_score == 0 and p2.match_score == 0:
+                    self.send_rcon(f'say "^5[MATCH] ^2{p1.clean_name} ^7vs ^2{p2.clean_name} ^7- First to ^3{limit} ^7starts NOW!"')
+                else:
+                    self.send_rcon(f'say "^5[DUEL] ^7Challenge: ^2{p1.clean_name} ^7(^5{int(p1.rating)}^7) vs ^2{p2.clean_name} ^7(^5{int(p2.rating)}^7)"')
+            
+            return
+
+        # 4. DUEL LOGIC (End)
+        m_end = re.search(r'DuelEnd:\s+(.*?)\s+has defeated\s+(.*?)\s+in a private duel', line, re.IGNORECASE)
+        if m_end:
+            try:
+                raw_w, raw_l = m_end.group(1).strip(), m_end.group(2).strip()
+                winner = next((x for x in self.players if x.clean_name == normalize(raw_w)), None)
+                loser = next((x for x in self.players if x.clean_name == normalize(raw_l)), None)
+
+                if winner and loser:
+                    duel_key = tuple(sorted([winner.clean_name, loser.clean_name]))
+                    
+                    # GATE 1: Verify this was a registered active duel
+                    if duel_key not in self.active_duels:
+                        retun
+
+                    # GATE 2: Pair-specific timing lockout
+                    current_time = time.time()
+                    pair_last = self.last_announcement_time.get(duel_key, 0)
+                    if (current_time - pair_last) < 3.0:
+                        return
+                    
+                    # Update the lockout time and discard the active duel
+                    self.last_announcement_time[duel_key] = current_time
+                    self.active_duels.discard(duel_key) 
+
+                    # --- ALL GATES PASSED: PROCESS WIN ---
+                    self.calculate_glicko2(winner, loser)
+
+                    # Handle !dduel match scoring
+                    if winner.opponent == loser:
+                        winner.match_score += 1
+                        limit = getattr(winner, 'pending_limit', 5)
+                        
+                        # Update Database
+                        with sqlite3.connect(self.db_filename) as conn:
+                            w_f = 'guid' if (winner.guid and len(winner.guid) > 10) else 'clean_name'
+                            l_f = 'guid' if (loser.guid and len(loser.guid) > 10) else 'clean_name'
+                            conn.execute(f"UPDATE players SET total_rounds_won = total_rounds_won + 1 WHERE {w_f}=?", (winner.guid if 'guid' in w_f else winner.clean_name,))
+                            conn.execute(f"UPDATE players SET total_rounds_lost = total_rounds_lost + 1 WHERE {l_f}=?", (loser.guid if 'guid' in l_f else loser.clean_name,))
+                            conn.commit()
+
+                        self.save_match_progress(winner, loser)
+                        self.send_rcon(f'say "^5[MATCH] ^2{winner.clean_name} ^7({winner.match_score}/{limit}) vs ^2{loser.clean_name} ^7({loser.match_score}/{limit})" ')
+                        
+                        if winner.match_score >= limit:
+                            self.finalize_match(winner, loser)
+                    
+                    else:
+                        # Standard Random Duel
+                        self.send_rcon(f'say "^5[DUEL] ^2{winner.clean_name} ^7wins! ^2{int(winner.rating)} ^7| ^2{loser.clean_name} ^7dropped to ^1{int(loser.rating)}"')
+                        
+            except Exception as e:
+                print(f"[PARSER ERROR] m_end failed: {e}")
+            
+            return
+
+        # 5. DISCONNECT CLEANUP (Removed 'entered the game')
+        elif "ClientDisconnect:" in line:
+            m = re.search(r'ClientDisconnect:\s*(\d+)', line)
+            if m:
+                t_sid = int(m.group(1)) # Group 1 because the regex is now simpler
+                t_p = next((x for x in self.players if x.id == t_sid), None)
+                
+                if t_p:
+                    # --- THE FORFEIT LOGIC ---
+                    if t_p.opponent:
+                        opp = t_p.opponent
+                        self.send_rcon(f'say "^5[MATCH] ^2{opp.name} ^7wins! ^2{t_p.name} ^7left the server."')
+                        opp.opponent = None
+                        opp.match_score = 0
+
+                    # --- CLEAR ACTIVE DUEL GATE ---
+                    # Use a set comprehension to filter out the leaving player's name
+                    self.active_duels = {key for key in self.active_duels if t_p.clean_name not in key}
+                    
+                    # --- SESSION REMOVAL ---
+                    # This ensures that if they rejoin, sync_player creates a fresh object
+                    self.players = [p for p in self.players if p.id != t_sid]  
+
+        # --- SMOD ADMIN PARSER ---
+        if "SMOD smsay:" in line:
+            # DEBUG 1: Verify the script picked up the SMOD trigger
+            # print(f"[DEBUG] SMOD line detected: {line.strip()}") 
+
+            # Regex tailored to your debug log: handles the "):" without a space
+            smod_match = re.search(r'SMOD smsay:\s+(.*?)\s+\(adminID:\s+(\d+)\).*?\):\s*(.*)$', line)
+            
+            if smod_match:
+                admin_raw_name = smod_match.group(1).strip()
+                admin_id = smod_match.group(2)
+                full_message = smod_match.group(3).strip()
+                
+                # DEBUG 2: Verify the regex captured the correct groups
+                # print(f"[DEBUG] Regex Match Success! Admin: {admin_raw_name}, ID: {admin_id}, Msg: {full_message}")
+                
+                self.handle_smod_command(admin_raw_name, admin_id, full_message)
+            else:
+                # DEBUG 3: If the line was seen but regex failed
+                # print(f"[DEBUG] Regex FAILED to match SMOD line format.")
+                pass
+
+        # --- GLOBAL CHAT BLOCK ---
+        elif "say:" in line.lower():
+            # FIX 1: Bot Filter (Stops bot from reading its own [DUEL] announcements)
+            if any(x in line for x in ["[DUEL]", "[DB]", "[MATCH]"]):
+                return
+            try:
+                # 1. Extract raw SID string
+                sid_match = re.search(r'(\d+)[:\s]*say:', line, re.IGNORECASE)
+                msg_match = re.search(r'say:\s*(.*?):\s*"(.*)"', line)
+                
+                if sid_match and msg_match:
+                    sid_str = sid_match.group(1)
+                    raw_name = msg_match.group(1)
+                    message = msg_match.group(2).strip()
+
+                    # FIX 2: Safe SID conversion (Prevents 'CB|Rogue' crash)
+                    try:
+                        log_sid = self.update_player_slot(sid_str, raw_name)
+                    except (ValueError, TypeError):
+                        # If regex slips and grabs a name instead of ID, ignore this line
+                        return
+
+                    # 3. Use 'is not None' to allow Slot 0
+                    p = next((x for x in self.players if x.id == log_sid), None)
+                    
+                    if p is not None:
+                        p.id = log_sid # Sync mashed ID to clean ID
+                        self.handle_chat(p, message)
+                    else:
+                        # Fallback for sync failures (Ghost Player)
+                        p_temp = Player(log_sid, raw_name, "0")
+                        self.handle_chat(p_temp, message)
+            except Exception as e:
+                print(f"[PARSER ERROR] Say line failed: {e}")
+
+        # --- PRIVATE MESSAGE (TELL) BLOCK ---
+        elif "tell:" in line.lower():
+            try:
+                sid_match = re.search(r'(\d+)\s*tell:', line, re.IGNORECASE)
+                # Captures the sender name and the message
+                msg_match = re.search(r'tell:\s*(.*?)\s+to\s+.*?:\s*"(.*)"', line)
+                
+                if sid_match and msg_match:
+                    sid_str = sid_match.group(1)
+                    raw_sender = msg_match.group(1).strip()
+                    message = msg_match.group(2).strip()
+
+                    # FIX 3: Safe SID conversion for Tells
+                    try:
+                        log_sid = self.update_player_slot(sid_str, raw_sender)
+                    except (ValueError, TypeError):
+                        return
+
+                    p = next((x for x in self.players if x.id == log_sid), None)
+                    
+                    # Safe fallback for Slot 0
+                    if p is None:
+                        clean_n = normalize(raw_sender) # Ensure normalize is available
+                        p = next((x for x in self.players if x.clean_name == clean_n), None)
+
+                    if p is not None:
+                        p.id = log_sid
+                        self.handle_chat(p, message)
+                    else:
+                        p_temp = Player(log_sid, raw_sender, "0")
+                        self.handle_chat(p_temp, message)
+            except Exception as e:
+                print(f"[PARSER ERROR] Tell line failed: {e}")
+
 
     def sync_player(self, sid, name, guid):
         valid_guid = guid and guid != "0" and len(guid) > 10
