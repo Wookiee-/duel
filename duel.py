@@ -817,6 +817,13 @@ class MBIIDuelPlugin:
         last_sz = os.path.getsize(log) if os.path.exists(log) else 0
         print(f"[SYSTEM] Plugin active. Monitoring {log} (Gate Method Active)")
 
+        # 1. Initialize bookmark at the CURRENT END of the file
+        # This skips all existing text so we only wait for new lines
+        if os.path.exists(log):
+            last_sz = os.path.getsize(log)
+        else:
+            last_sz = 0
+
         while True:
             try:
                 if not os.path.exists(log):
