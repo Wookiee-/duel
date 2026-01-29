@@ -838,6 +838,7 @@ class MBIIDuelPlugin:
                     with open(log, 'r', encoding='utf-8', errors='ignore') as f:
                         f.seek(last_sz)
                         lines = f.readlines()
+
                         last_sz = f.tell()
 
                         for line in lines:
@@ -874,18 +875,20 @@ class MBIIDuelPlugin:
         if m_info:
             slot_id = int(m_info.group(1))
             full_name = m_info.group(2).strip()
+            clean_n = normalize(full_name)
+
+            # CHECK IF PLAYER EXISTS FIRST
+            p = next((x for x in self.players if x.clean_name == clean_n), None)
+
+            if p:
+                # Update existing player's slot only
+                p.id = slot_id
+                self.slot_map[slot_id] = p
+            else:
+                # Only sync (create new) if they aren't in memory
+                p = self.sync_player(slot_id, full_name, "0")
+                self.slot_map[slot_id] = p
             
-            # 1. Sync returns the player object and handles DB updates
-            p = self.sync_player(slot_id, full_name, "0") 
-            
-            # 2. Update the Slot Map (Crucial for !dduel and ID-based lookups)
-            self.slot_map[slot_id] = p 
-            
-            # 3. List Integrity: Ensure this player object is the ONLY one in self.players for this slot
-            self.players = [player for player in self.players if player.id != slot_id]
-            self.players.append(p)
-            
-            print(f"[DEBUG] Slot {slot_id} is now mapped to {p.clean_name}")
             return
 
         # Capture GUIDs (Player 0: zaanne ja_guid\ABC...)
@@ -943,19 +946,18 @@ class MBIIDuelPlugin:
                 if winner and loser:
                     duel_key = tuple(sorted([winner.clean_name, loser.clean_name]))
                     
-                    # GATE 1: Verify this was a registered active duel
+                    # GATE 1: Verify and immediately close
                     if duel_key not in self.active_duels:
-                        retun
+                        return
 
-                    # GATE 2: Pair-specific timing lockout
+                    # GATE 2: Secondary safety for duplicate log lines
                     current_time = time.time()
-                    pair_last = self.last_announcement_time.get(duel_key, 0)
-                    if (current_time - pair_last) < 3.0:
+                    if (current_time - self.last_announcement_time.get(duel_key, 0)) < 2.0:
                         return
                     
-                    # Update the lockout time and discard the active duel
+                    # LOCK BOTH GATES NOW
+                    self.active_duels.discard(duel_key)
                     self.last_announcement_time[duel_key] = current_time
-                    self.active_duels.discard(duel_key) 
 
                     # --- ALL GATES PASSED: PROCESS WIN ---
                     self.calculate_glicko2(winner, loser)
