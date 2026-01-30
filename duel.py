@@ -877,18 +877,27 @@ class MBIIDuelPlugin:
             full_name = m_info.group(2).strip()
             clean_n = normalize(full_name)
 
-            # CHECK IF PLAYER EXISTS FIRST
+            # 1. Search for the player by name instead of just creating a new one
             p = next((x for x in self.players if x.clean_name == clean_n), None)
 
             if p:
-                # Update existing player's slot only
+                # 2. Update existing player's ID and map it
                 p.id = slot_id
                 self.slot_map[slot_id] = p
+                # DO NOT return yet, ensure the list integrity below
             else:
-                # Only sync (create new) if they aren't in memory
+                # 3. Only create a brand new object if they aren't in memory
                 p = self.sync_player(slot_id, full_name, "0")
                 self.slot_map[slot_id] = p
+
+            # 4. List Integrity: Ensure this player object is the ONLY one in self.players for this slot
+            # We filter by slot_id to remove any OLD player who used to be in this chair
+            self.players = [player for player in self.players if player.id != slot_id or player == p]
             
+            if p not in self.players:
+                self.players.append(p)
+            
+            print(f"[DEBUG] Slot {slot_id} is now mapped to {p.clean_name}")
             return
 
         # Capture GUIDs (Player 0: zaanne ja_guid\ABC...)
@@ -1134,12 +1143,21 @@ class MBIIDuelPlugin:
                              (guid if valid_guid else f"TEMP_{current_clean}", current_name, current_clean, clan, rating, rd))
             conn.commit()
 
-        # --- THE FIX FOR LIVE MEMORY ---
-        # 1. Remove by name to handle renames/rejoins
-        self.players = [p for p in self.players if p.clean_name != current_clean]
-        
-        # 2. Only remove by ID if it's a real slot (not our -1 fallback)
+        existing_p = next((p for p in self.players if p.clean_name == current_clean), None)
+
+        if existing_p:
+            # Update the existing object so we don't lose duel state/opponents
+            existing_p.id = sid
+            existing_p.rating = rating
+            existing_p.rd = rd
+            # If the ID changed (player moved slots), update the slot map
+            if sid != -1:
+                self.slot_map[sid] = existing_p
+            return existing_p
+
+        # 2. If they DON'T exist, only then do we create a new one
         if sid != -1:
+            # Clean out the slot if someone else was in it
             self.players = [p for p in self.players if p.id != sid]
         
         new_player = Player(sid, name, guid, rating, rd, clan=clan, role=role, group=group)
@@ -1148,7 +1166,7 @@ class MBIIDuelPlugin:
         if sid != -1:
             self.slot_map[sid] = new_player
             
-        return new_player # MUST return the object
+        return new_player
 
     def send_rcon(self, command):
         try:
