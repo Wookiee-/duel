@@ -59,6 +59,10 @@ class MBIIDuelPlugin:
         self.slot_map = {}
         self.active_matches = {}
         self.last_announcement_time = {}
+        self.last_info_sig = ""
+        self.last_kill_sig = ""
+        self.last_duel_start_sig = ""
+        self.last_duel_end_sig = ""
 
         
         # Load any existing progress from previous map/round
@@ -667,21 +671,13 @@ class MBIIDuelPlugin:
             self.send_rcon(f'svtell {target.id} "^5[MATCH] ^2{p.name} ^7challenged you to First to ^3{rounds}^7. Type ^2!dyes ^7to accept."')
             self.send_rcon(f'svtell {p.id} "^5[MATCH] ^7Challenge sent to ^2{target.name}^7 for First to ^3{rounds}^7."')
 
-        elif cmd[0] == "!dyes" and p.pending_invite_from:
-            inviter = p.pending_invite_from
-            if inviter in self.players:
-                # Link them as match opponents
-                p.opponent, inviter.opponent = inviter, p
-                p.match_score = inviter.match_score = 0
-                
-                # IMPORTANT: Sync the dynamic limit from the invite to both players
-                match_limit = p.pending_limit
-                inviter.pending_limit = match_limit 
-                
-                self.send_rcon(f'svtell {p.id} "^5[MATCH] ^7Accepted. Match to ^3{match_limit} ^7confirmed!"')
-                self.send_rcon(f'svtell {inviter.id} "^5[MATCH] ^2{p.name} ^7accepted! Match to ^3{match_limit} ^7confirmed!"')
-            
-            p.pending_invite_from = None
+        elif cmd[0] == "!dyes":
+            if p.pending_invite_from:
+                challenger = p.pending_invite_from
+                p.opponent = challenger
+                challenger.opponent = p
+                # We don't clear pending_invite_from yet; let DuelStart handle it
+                self.send_rcon(f'svtell {p.id} "^2Challenge accepted! Start the duel in-game."')
 
         elif cmd[0] == "!dno" and p.pending_invite_from:
             inviter = p.pending_invite_from
@@ -813,16 +809,14 @@ class MBIIDuelPlugin:
 
     def run(self):
         log = self.settings['logname']
+        
         # Initialize bookmark at the current end to skip old duplicates on restart
-        last_sz = os.path.getsize(log) if os.path.exists(log) else 0
-        print(f"[SYSTEM] Plugin active. Monitoring {log} (Gate Method Active)")
-
-        # 1. Initialize bookmark at the CURRENT END of the file
-        # This skips all existing text so we only wait for new lines
         if os.path.exists(log):
             last_sz = os.path.getsize(log)
         else:
             last_sz = 0
+            
+        print(f"[SYSTEM] Plugin active. Monitoring {log} (Gate Method Active)")
 
         while True:
             try:
@@ -831,75 +825,81 @@ class MBIIDuelPlugin:
                     continue
 
                 curr_sz = os.path.getsize(log)
+                
+                # Handle log rotation (server restarted or log cleared)
                 if curr_sz < last_sz:
-                    last_sz = 0 # Handle log rotation
+                    last_sz = 0 
 
                 if curr_sz > last_sz:
                     with open(log, 'r', encoding='utf-8', errors='ignore') as f:
                         f.seek(last_sz)
                         lines = f.readlines()
-
+                        
+                        # Update the pointer to where we finished reading
                         last_sz = f.tell()
 
                         for line in lines:
                             line = line.strip()
                             if not line: continue
-                            # This calls the standalone method below
-                            self.parse_line(line)
+                            
+                            # Execute parse_line. If it returns True (InitGame detected),
+                            # we jump to the end of the current file size.
+                            if self.parse_line(line) is True:
+                                last_sz = curr_sz
+                                break # Stop processing the rest of the current buffer
 
                 time.sleep(0.1)
             except Exception as e:
                 print(f"[CRITICAL ERROR] Loop failure: {e}")
-                time.sleep(2)                         
+                time.sleep(2)                     
 
     def parse_line(self, line):    
 
         if "InitGame:" in line:
-            # self.send_rcon('say "^5[SYSTEM] ^7Map/Round change detected. Restoring states..."')
-            # Clear temporary lobby lists
+            # Clear temporary session lists
             self.lobby_players = []
             self.active_tournament = False
-            self.players = []
-            self.slot_map = {}
-            self.active_duels = set()
-            # CRITICAL: Ask the server who is here immediately
             self.send_rcon("status")
-            
-            # CRITICAL: Re-sync players so the script knows who is in which slot
-            # This calls the status command to rebuild self.players and self.slot_map
-            threading.Timer(2.0, self.force_sync_players).start()
-            return
+            threading.Timer(1.0, self.force_sync_players).start()
+            return True
 
-        # --- THE SWITCHBOARD (Keep this updated!) ---
+        # --- THE SWITCHBOARD (Sync-Shielded Version) ---
         m_info = re.search(r'ClientUserinfoChanged: (\d+) n\\(.*?)\\t\\', line)
         if m_info:
             slot_id = int(m_info.group(1))
             full_name = m_info.group(2).strip()
             clean_n = normalize(full_name)
+            
+            # 1. SIGNATURE GATE: Stop the log-repeat immediately
+            sig = f"info-{slot_id}-{full_name}-{line.strip()}"
+            if sig == getattr(self, 'last_info_sig', None):
+                return
+            self.last_info_sig = sig
 
-            # 1. Search for the player by name instead of just creating a new one
+            # 2. THE PROTECTIVE LOOKUP
             p = next((x for x in self.players if x.clean_name == clean_n), None)
-
+            
             if p:
-                # 2. Update existing player's ID and map it
+                # IF THE PLAYER IS ALREADY IN THIS SLOT, DO NOT TOUCH THEM.
+                # This is the "Shield" that stops the 60s sync from breaking things.
+                if p.id == slot_id and self.slot_map.get(slot_id) == p:
+                    return 
+                
+                # If they moved slots, update mapping but PRESERVE their object
                 p.id = slot_id
                 self.slot_map[slot_id] = p
-                # DO NOT return yet, ensure the list integrity below
             else:
-                # 3. Only create a brand new object if they aren't in memory
+                # Truly a new player
                 p = self.sync_player(slot_id, full_name, "0")
                 self.slot_map[slot_id] = p
 
-            # 4. List Integrity: Ensure this player object is the ONLY one in self.players for this slot
-            # We filter by slot_id to remove any OLD player who used to be in this chair
-            self.players = [player for player in self.players if player.id != slot_id or player == p]
-            
+            # 3. LIST INTEGRITY
+            self.players = [player for player in self.players if (player.id != slot_id or player == p)]
             if p not in self.players:
                 self.players.append(p)
             
-            print(f"[DEBUG] Slot {slot_id} is now mapped to {p.clean_name}")
             return
-
+            
         # Capture GUIDs (Player 0: zaanne ja_guid\ABC...)
         m_spawn = re.search(r'(?:Player|ClientInfo)\s+(\d+).*?ja_guid\\([A-Z0-9]{32})', line)
         if m_spawn:
@@ -914,34 +914,39 @@ class MBIIDuelPlugin:
         # 3. DUEL LOGIC (Start)
         m_start = re.search(r'DuelStart: (.*?) challenged (.*?) to a private duel', line)
         if m_start:
-            raw_p1 = m_start.group(1).strip()
-            raw_p2 = m_start.group(2).strip()
+            raw_p1, raw_p2 = m_start.group(1).strip(), m_start.group(2).strip()
             
+            # SIGNATURE GATE
+            sig = f"start-{raw_p1}-{raw_p2}-{line.strip()}"
+            if sig == self.last_duel_start_sig:
+                return
+            self.last_duel_start_sig = sig
+
             p1 = next((x for x in self.players if x.clean_name == normalize(raw_p1)), None)
             p2 = next((x for x in self.players if x.clean_name == normalize(raw_p2)), None)
 
-            # Fallback: Create player object if they aren't in memory
             if not p1: p1 = self.sync_player(-1, raw_p1, "0")
             if not p2: p2 = self.sync_player(-1, raw_p2, "0")
 
             if p1 and p2:
-                # Create a unique key for this pair (alphabetical order)
                 duel_key = tuple(sorted([p1.clean_name, p2.clean_name]))
-                
-                # GATE: If this pair is already marked active, ignore duplicate logs
                 if duel_key in self.active_duels:
                     return
                 
-                # Register the duel as active
                 self.active_duels.add(duel_key)
-
-                # Announce the match
                 limit = getattr(p1, 'pending_limit', 5)
-                if p1.opponent == p2 and p1.match_score == 0 and p2.match_score == 0:
+                if p2.pending_invite_from == p1:
+                    limit = p2.pending_limit
+                elif p1.pending_invite_from == p2:
+                    limit = p1.pending_limit
+
+                p1.opponent, p2.opponent = p2, p1
+                p1.match_score = p2.match_score = 0
+                
+                if (p1.opponent == p2 or p2.opponent == p1) and (p1.pending_invite_from or p2.pending_invite_from):
                     self.send_rcon(f'say "^5[MATCH] ^2{p1.clean_name} ^7vs ^2{p2.clean_name} ^7- First to ^3{limit} ^7starts NOW!"')
                 else:
                     self.send_rcon(f'say "^5[DUEL] ^7Challenge: ^2{p1.clean_name} ^7(^5{int(p1.rating)}^7) vs ^2{p2.clean_name} ^7(^5{int(p2.rating)}^7)"')
-            
             return
 
         # 4. DUEL LOGIC (End)
@@ -949,34 +954,31 @@ class MBIIDuelPlugin:
         if m_end:
             try:
                 raw_w, raw_l = m_end.group(1).strip(), m_end.group(2).strip()
+                
+                # SIGNATURE GATE: Kill the process immediately if we've seen this exact kill
+                sig = f"end-{raw_w}-{raw_l}-{line.strip()}"
+                if sig == self.last_duel_end_sig:
+                    return
+                self.last_duel_end_sig = sig
+
                 winner = next((x for x in self.players if x.clean_name == normalize(raw_w)), None)
                 loser = next((x for x in self.players if x.clean_name == normalize(raw_l)), None)
 
                 if winner and loser:
                     duel_key = tuple(sorted([winner.clean_name, loser.clean_name]))
                     
-                    # GATE 1: Verify and immediately close
                     if duel_key not in self.active_duels:
                         return
 
-                    # GATE 2: Secondary safety for duplicate log lines
-                    current_time = time.time()
-                    if (current_time - self.last_announcement_time.get(duel_key, 0)) < 2.0:
-                        return
-                    
-                    # LOCK BOTH GATES NOW
                     self.active_duels.discard(duel_key)
-                    self.last_announcement_time[duel_key] = current_time
-
-                    # --- ALL GATES PASSED: PROCESS WIN ---
                     self.calculate_glicko2(winner, loser)
 
-                    # Handle !dduel match scoring
-                    if winner.opponent == loser:
+                    is_formal_match = (winner.pending_invite_from == loser or loser.pending_invite_from == winner)
+
+                    if is_formal_match:
                         winner.match_score += 1
                         limit = getattr(winner, 'pending_limit', 5)
                         
-                        # Update Database
                         with sqlite3.connect(self.db_filename) as conn:
                             w_f = 'guid' if (winner.guid and len(winner.guid) > 10) else 'clean_name'
                             l_f = 'guid' if (loser.guid and len(loser.guid) > 10) else 'clean_name'
@@ -989,15 +991,42 @@ class MBIIDuelPlugin:
                         
                         if winner.match_score >= limit:
                             self.finalize_match(winner, loser)
-                    
+                            winner.opponent = loser.opponent = None
+                            winner.pending_invite_from = loser.pending_invite_from = None
                     else:
-                        # Standard Random Duel
+                        winner.opponent = loser.opponent = None
                         self.send_rcon(f'say "^5[DUEL] ^2{winner.clean_name} ^7wins! ^2{int(winner.rating)} ^7| ^2{loser.clean_name} ^7dropped to ^1{int(loser.rating)}"')
                         
             except Exception as e:
                 print(f"[PARSER ERROR] m_end failed: {e}")
-            
             return
+
+        # 5. KILLS (Standard non-duel kills)
+        elif "Kill: " in line:
+            m = re.search(r'Kill:\s*(\d+)\s+(\d+)\s+(\d+):', line)
+            if m:
+                k_id, v_id, w_id = m.group(1), m.group(2), m.group(3)
+                
+                # SIGNATURE GATE
+                sig = f"kill-{k_id}-{v_id}-{w_id}-{line.strip()}"
+                if sig == getattr(self, 'last_kill_sig', None):
+                    return
+                self.last_kill_sig = sig
+
+                # Look up players
+                killer = self.slot_map.get(int(k_id))
+                victim = self.slot_map.get(int(v_id))
+
+                if killer and victim and killer != victim:
+                    # CROSS-CHECK: If they are in a duel, IGNORE this kill.
+                    # The DuelEnd block will handle the rating change instead.
+                    duel_key = tuple(sorted([killer.clean_name, victim.clean_name]))
+                    if duel_key in self.active_duels:
+                        return # Let DuelEnd handle it
+
+                    # Only process standard kills here (if you want rating for open-world kills)
+                    # self.calculate_glicko2(killer, victim) 
+            return    
 
         # 5. DISCONNECT CLEANUP (Removed 'entered the game')
         elif "ClientDisconnect:" in line:
