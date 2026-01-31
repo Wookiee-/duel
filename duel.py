@@ -31,9 +31,11 @@ class Player:
         self.match_score = 0
         self.opponent = None
         self.is_paused = False
-        self.pending_invite_from = None 
+        self.is_formal_pending = False
+        self.pending_invite_from = None
         self.pending_limit = 5
-        self.pending_group_request = None
+        self.match_score = 0
+        self.match_limit = 5
 
 class MBIIDuelPlugin:
     def __init__(self):
@@ -64,13 +66,33 @@ class MBIIDuelPlugin:
         self.last_duel_start_sig = ""
         self.last_duel_end_sig = ""
 
+        threading.Timer(2.0, self.force_sync_players).start()
+
         
         # Load any existing progress from previous map/round
         self.restore_match_progress()
 
     def force_sync_players(self):
-        # Just fire the command. The main loop will catch the response.
-        self.send_rcon("status")
+        # 1. Get the raw text from the status command
+        status_data = self.send_rcon("status") 
+        if not status_data:
+            return
+
+        # 2. Parse the status response line by line
+        for line in status_data.split('\n'):
+            parts = line.split()
+            # Most MBII status lines start with the slot ID (0-31)
+            if len(parts) >= 4 and parts[0].isdigit():
+                slot_id = int(parts[0])
+                raw_name = parts[3] 
+                
+                # 3. Use your sync_player logic to re-populate memory
+                p = self.sync_player(slot_id, raw_name, "0")
+                
+                # 4. Save to your freshly cleared memory
+                self.slot_map[slot_id] = p
+                if p not in self.players:
+                    self.players.append(p)
 
     def start_status_loop(self):
         def loop():
@@ -118,6 +140,8 @@ class MBIIDuelPlugin:
 
     def init_sqlite(self):
         with sqlite3.connect(self.db_filename, timeout=20) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
             cursor = conn.cursor()
             # 1. Create the players table with all necessary columns
             cursor.execute('''CREATE TABLE IF NOT EXISTS players (
@@ -147,20 +171,19 @@ class MBIIDuelPlugin:
             
             conn.commit()
 
-        # 4. Migration Block: Add columns to existing databases that might be missing them
+        # 4. Migration Block: Ensure all stats columns exist
         with sqlite3.connect(self.db_filename) as conn:
             columns_to_add = [
+                ("total_rounds_won", "INTEGER DEFAULT 0"),
                 ("total_rounds_lost", "INTEGER DEFAULT 0"),
-                # You can add more columns here in the future if needed
+                ("tournament_wins", "INTEGER DEFAULT 0")
             ]
             for col_name, col_type in columns_to_add:
                 try:
                     conn.execute(f"ALTER TABLE players ADD COLUMN {col_name} {col_type}")
                     conn.commit()
-                    print(f"[SYSTEM] Database Migration: Added {col_name} column.")
                 except sqlite3.OperationalError:
-                    # Column already exists
-                    pass 
+                    pass # Column exists 
                     
         with sqlite3.connect(self.db_filename) as conn:
             # This deletes any "junk" 1500 entries if a higher rating entry exists for the same name
@@ -194,6 +217,41 @@ class MBIIDuelPlugin:
     def detect_clan(self, name):
         match = re.search(r'^[\[<\(](.*?)[\]>\)]|^(.*?)\s?\|', normalize(name))
         return match.group(1).strip().upper() if match and match.group(1) else "NONE"
+
+    def handle_spec_reset(self, player):
+        # Find if this player is in an active duel
+        for duel_key in list(self.active_duels):
+            if player.clean_name in duel_key:
+                # Find the opponent's name
+                opp_name = duel_key[1] if duel_key[0] == player.clean_name else duel_key[0]
+                
+                # Remove from active duels
+                self.active_duels.discard(duel_key)
+                
+                # Clean up player objects
+                player.opponent = None
+                opp_player = next((x for x in self.players if x.clean_name == opp_name), None)
+                if opp_player:
+                    opp_player.opponent = None
+                
+                self.send_rcon(f"say ^7[DUEL] ^1Duel Cancelled: ^7{player.name} went to Spectator.")
+                print(f"[SYSTEM] Duel reset: {player.clean_name} went to spec.")
+                
+    def handle_player_exit(self, p, reason="left"):
+        # Clear the global duel gate
+        self.active_duels = {key for key in self.active_duels if p.clean_name not in key}
+
+        if p.opponent:
+            opp = p.opponent
+            self.send_rcon(f'say "^5[DUEL] ^2{opp.name} ^7wins! ^2{p.name} ^7{reason}."')
+            
+            # Full state reset for both players
+            opp.opponent = None
+            opp.match_score = 0
+            p.opponent = None
+            p.match_score = 0
+            
+        print(f"[SYSTEM] Cleaned up duel state for {p.clean_name} ({reason})")                
 
     def calculate_glicko2(self, winner, loser):
         try:
@@ -630,54 +688,68 @@ class MBIIDuelPlugin:
             self.send_rcon(f'say "^5[FORFEIT] ^2{p.name} ^7surrendered to ^2{winner.name}^7."')
             self.finalize_match(winner, p)
 
+        elif cmd[0] == "!dlist":
+            # Filter for players who actually have a valid slot ID
+            online = [f"{x.clean_name}({x.id})" for x in self.players if x.id != -1]
+            if not online:
+                self.send_rcon(f'svtell {p.id} "^1Error: ^7Memory is empty. Try joining a team."')
+            else:
+                out = " ^7| ^2".join(online)
+                self.send_rcon(f'svtell {p.id} "^5[DEBUG] ^7Memory: ^2{out}"')  
+
         elif cmd[0] == "!dduel":
             if len(cmd) < 3:
                 return self.send_rcon(f'svtell {p.id} "^1Usage: ^7!dduel <name/id> <rounds>"')
 
             try:
-                # Capture the dynamic round limit
                 rounds = int(cmd[-1])
-                if rounds < 1: rounds = 1
-                
                 target_input = " ".join(cmd[1:-1])
-                target_search = normalize(target_input)
-            except ValueError:
+                target_search = normalize(target_input) 
+            except:
                 return self.send_rcon(f'svtell {p.id} "^1Error: ^7Rounds must be a number."')
 
-            # --- SEARCH LOGIC ---
-            target = next((x for x in self.players if x.id == (int(target_input) if target_input.isdigit() else -99)), None)
-            if not target:
-                target = next((x for x in self.players if x.clean_name == target_search), None)
+            target = None
+            
+            # Search memory by Slot ID first
+            if target_input.isdigit():
+                target = self.slot_map.get(int(target_input))
+            
+            # Search memory by Name (Partial Match)
             if not target:
                 target = next((x for x in self.players if target_search in x.clean_name), None)
 
-            # --- FALLBACK POPULATE ---
             if not target:
-                with sqlite3.connect(self.db_filename) as conn:
-                    db_row = conn.execute("SELECT name, guid FROM players WHERE clean_name LIKE ? LIMIT 1", (f'%{target_search}%',)).fetchone()
-                    if db_row:
-                        target = self.sync_player(-1, db_row[0], db_row[1])
+                return self.send_rcon(f'svtell {p.id} "^1Error: ^7Player \'{target_input}\' not in memory."')
 
-            if not target:
-                return self.send_rcon(f'svtell {p.id} "^1Error: ^7Player not found."')
-            
-            if target.id == p.id:
-                return self.send_rcon(f'svtell {p.id} "^1Error: ^7You cannot challenge yourself."')
-
-            # CRITICAL: Store the limit and the inviter
+            # Set the invite in the target's player object
             target.pending_invite_from = p
-            target.pending_limit = rounds # <--- Dynamic value saved
+            target.pending_limit = rounds 
             
-            self.send_rcon(f'svtell {target.id} "^5[MATCH] ^2{p.name} ^7challenged you to First to ^3{rounds}^7. Type ^2!dyes ^7to accept."')
-            self.send_rcon(f'svtell {p.id} "^5[MATCH] ^7Challenge sent to ^2{target.name}^7 for First to ^3{rounds}^7."')
+            self.send_rcon(f'svtell {target.id} "^5[MATCH] ^2{p.name} ^7challenged you. Type ^2!dyes ^7to accept."')
+            self.send_rcon(f'svtell {p.id} "^5[MATCH] ^7Challenge sent to ^2{target.name}^7."')
 
         elif cmd[0] == "!dyes":
             if p.pending_invite_from:
                 challenger = p.pending_invite_from
+                
+                p.match_score = 0
+                challenger.match_score = 0
+                
+                # 1. Set the match flag and transfer the round limit
+                p.match_limit = p.pending_limit
+                challenger.match_limit = p.pending_limit
+                p.is_formal_match = True
+                challenger.is_formal_match = True
+                
+                # 2. Link them as opponents
                 p.opponent = challenger
                 challenger.opponent = p
-                # We don't clear pending_invite_from yet; let DuelStart handle it
-                self.send_rcon(f'svtell {p.id} "^2Challenge accepted! Start the duel in-game."')
+                
+                # 3. Clear the invite but KEEP the match flag
+                p.pending_invite_from = None
+                
+                self.send_rcon(f'svtell {p.id} "^2Match Accepted! ^7First to ^3{p.match_limit}^7. Start the duel now."')
+                self.send_rcon(f'svtell {challenger.id} "^2{p.name} accepted! ^7Match: First to ^3{p.match_limit}^7."')
 
         elif cmd[0] == "!dno" and p.pending_invite_from:
             inviter = p.pending_invite_from
@@ -687,13 +759,26 @@ class MBIIDuelPlugin:
         elif cmd[0] == "!dforfeit" and p.opponent and not self.active_tournament:
             winner = p.opponent
             
-            # NEW: Clear persistent data so the forfeited match doesn't restore next map
+            # 1. PROCESS RATINGS (Treat as a win for the opponent)
+            # This ensures the winner gets points and the quitter loses points
+            self.calculate_glicko2(winner, p)
+            
+            # 2. CLEAR PERSISTENT DB DATA
             with sqlite3.connect(self.db_filename) as conn:
                 conn.execute("DELETE FROM active_matches WHERE (p1_guid=? AND p2_guid=?) OR (p1_guid=? AND p2_guid=?)",
                              (p.guid, winner.guid, winner.guid, p.guid))
                 conn.commit()
 
-            self.send_rcon(f'say "^5[DUEL] ^2{p.name} ^7forfeited. ^2{winner.name} ^7wins!"')
+            # 3. RESET MATCH STATE
+            # Important: Clear flags so their next duel isn't accidentally a "Match"
+            p.match_score = winner.match_score = 0
+            p.is_formal_match = winner.is_formal_match = False
+            
+            # 4. ANNOUNCE
+            self.send_rcon(f'say "^5[MATCH] ^2{p.clean_name} ^7forfeited. ^2{winner.clean_name} ^7wins the set!"')
+            self.send_rcon(f'say "^5[DUEL] ^2{winner.clean_name} ^7rating: ^2{int(winner.rating)} ^7| ^2{p.clean_name} ^7rating: ^1{int(p.rating)}"')
+            
+            # 5. BREAK THE LINK
             p.opponent = winner.opponent = None
 
         elif cmd[0] == "!dtop":
@@ -704,6 +789,9 @@ class MBIIDuelPlugin:
             self.show_leaderboard("tournament_wins", "Tournament Wins", p.id)
         elif cmd[0] == "!dclantop":
             self.show_clan_leaderboard(p.id)
+        elif cmd[0] == "!sync":
+            self.force_sync_players()
+            self.send_rcon(f'svtell {p.id} "^5[SYSTEM] ^7Memory refreshed. {len(self.players)} players synced."')    
 
     def show_leaderboard(self, column, label, sid):
         with sqlite3.connect(self.db_filename) as conn:
@@ -810,13 +898,13 @@ class MBIIDuelPlugin:
     def run(self):
         log = self.settings['logname']
         
-        # Initialize bookmark at the current end to skip old duplicates on restart
+        # Initialize bookmark at the current end to skip old data on startup
         if os.path.exists(log):
             last_sz = os.path.getsize(log)
         else:
             last_sz = 0
             
-        print(f"[SYSTEM] Plugin active. Monitoring {log} (Gate Method Active)")
+        print(f"[SYSTEM] Plugin active. Monitoring {log} (High-Speed Mode)")
 
         while True:
             try:
@@ -826,78 +914,74 @@ class MBIIDuelPlugin:
 
                 curr_sz = os.path.getsize(log)
                 
-                # Handle log rotation (server restarted or log cleared)
                 if curr_sz < last_sz:
                     last_sz = 0 
 
                 if curr_sz > last_sz:
-                    with open(log, 'r', encoding='utf-8', errors='ignore') as f:
+                    with open(log, 'r', encoding='utf-8', errors='ignore', newline=None) as f:
                         f.seek(last_sz)
-                        lines = f.readlines()
                         
-                        # Update the pointer to where we finished reading
-                        last_sz = f.tell()
-
-                        for line in lines:
+                        # SPEED TWEAK: Line-by-line iterator is much faster than f.readlines()
+                        while True:
+                            line = f.readline()
+                            if not line:
+                                break
+                            
                             line = line.strip()
                             if not line: continue
                             
-                            # Execute parse_line. If it returns True (InitGame detected),
-                            # we jump to the end of the current file size.
+                            # Execute parse_line. If it returns True (InitGame), 
+                            # we jump the pointer to the very end of the file.
                             if self.parse_line(line) is True:
-                                last_sz = curr_sz
-                                break # Stop processing the rest of the current buffer
+                                f.seek(0, 2)
+                                last_sz = f.tell()
+                                break
+                        
+                        last_sz = f.tell()
 
                 time.sleep(0.1)
             except Exception as e:
                 print(f"[CRITICAL ERROR] Loop failure: {e}")
-                time.sleep(2)                     
+                time.sleep(2)                    
 
     def parse_line(self, line):    
 
         if "InitGame:" in line:
-            # Clear temporary session lists
+            # 1. Reset tournament and session flags
             self.lobby_players = []
             self.active_tournament = False
-            self.send_rcon("status")
-            threading.Timer(1.0, self.force_sync_players).start()
+            self.match_in_progress = False
+            
+            self.players = [] 
+            self.slot_map = {} 
+            
+            threading.Timer(2.0, self.force_sync_players).start()
+            
             return True
 
-        # --- THE SWITCHBOARD (Sync-Shielded Version) ---
-        m_info = re.search(r'ClientUserinfoChanged: (\d+) n\\(.*?)\\t\\', line)
+        m_info = re.search(r'ClientUserinfoChanged: (\d+) n\\(.*?)\\t\\(\d+)', line)
         if m_info:
             slot_id = int(m_info.group(1))
             full_name = m_info.group(2).strip()
+            team_id = m_info.group(3)
             clean_n = normalize(full_name)
-            
-            # 1. SIGNATURE GATE: Stop the log-repeat immediately
-            sig = f"info-{slot_id}-{full_name}-{line.strip()}"
-            if sig == getattr(self, 'last_info_sig', None):
-                return
-            self.last_info_sig = sig
 
-            # 2. THE PROTECTIVE LOOKUP
+            # 1. Force find or create
             p = next((x for x in self.players if x.clean_name == clean_n), None)
             
-            if p:
-                # IF THE PLAYER IS ALREADY IN THIS SLOT, DO NOT TOUCH THEM.
-                # This is the "Shield" that stops the 60s sync from breaking things.
-                if p.id == slot_id and self.slot_map.get(slot_id) == p:
-                    return 
-                
-                # If they moved slots, update mapping but PRESERVE their object
-                p.id = slot_id
-                self.slot_map[slot_id] = p
-            else:
-                # Truly a new player
+            if not p:
+                # If not in memory, sync from DB and add to list immediately
                 p = self.sync_player(slot_id, full_name, "0")
-                self.slot_map[slot_id] = p
-
-            # 3. LIST INTEGRITY
-            self.players = [player for player in self.players if (player.id != slot_id or player == p)]
-            if p not in self.players:
-                self.players.append(p)
+                if p not in self.players:
+                    self.players.append(p)
             
+            # 2. Update the critical mapping
+            p.id = slot_id
+            p.team = team_id
+            self.slot_map[slot_id] = p
+            
+            # Debug log to console so you can see it working
+            print(f"[DEBUG] Synced: {p.clean_name} to Slot {slot_id}")
             return
             
         # Capture GUIDs (Player 0: zaanne ja_guid\ABC...)
@@ -918,7 +1002,7 @@ class MBIIDuelPlugin:
             
             # SIGNATURE GATE
             sig = f"start-{raw_p1}-{raw_p2}-{line.strip()}"
-            if sig == self.last_duel_start_sig:
+            if sig == getattr(self, 'last_duel_start_sig', None):
                 return
             self.last_duel_start_sig = sig
 
@@ -929,24 +1013,32 @@ class MBIIDuelPlugin:
             if not p2: p2 = self.sync_player(-1, raw_p2, "0")
 
             if p1 and p2:
+                if getattr(p1, 'team', '0') == '3' or getattr(p2, 'team', '0') == '3':
+                    return 
+
                 duel_key = tuple(sorted([p1.clean_name, p2.clean_name]))
                 if duel_key in self.active_duels:
                     return
                 
                 self.active_duels.add(duel_key)
-                limit = getattr(p1, 'pending_limit', 5)
-                if p2.pending_invite_from == p1:
-                    limit = p2.pending_limit
-                elif p1.pending_invite_from == p2:
-                    limit = p1.pending_limit
 
-                p1.opponent, p2.opponent = p2, p1
-                p1.match_score = p2.match_score = 0
+                # --- MATCH DETECTION ---
+                limit = 5
+                tag = "^5[DUEL]"
                 
-                if (p1.opponent == p2 or p2.opponent == p1) and (p1.pending_invite_from or p2.pending_invite_from):
-                    self.send_rcon(f'say "^5[MATCH] ^2{p1.clean_name} ^7vs ^2{p2.clean_name} ^7- First to ^3{limit} ^7starts NOW!"')
+                # Check the flag set by !dyes
+                if getattr(p1, 'is_formal_match', False) or getattr(p2, 'is_formal_match', False):
+                    limit = getattr(p1, 'match_limit', getattr(p2, 'match_limit', 5))
+                    tag = "^5[MATCH]"
+                    # We do NOT reset is_formal_match here so that Round 2, 3, etc. still show [MATCH]
+
+                # Link opponents for the scoring block
+                p1.opponent, p2.opponent = p2, p1
+                
+                if tag == "^5[MATCH]":
+                    self.send_rcon(f'say "{tag} ^2{p1.clean_name} ^7vs ^2{p2.clean_name} ^7- First to ^3{limit} ^7starts NOW!"')
                 else:
-                    self.send_rcon(f'say "^5[DUEL] ^7Challenge: ^2{p1.clean_name} ^7(^5{int(p1.rating)}^7) vs ^2{p2.clean_name} ^7(^5{int(p2.rating)}^7)"')
+                    self.send_rcon(f'say "{tag} ^7Challenge: ^7{p1.clean_name} ^7(^5{int(p1.rating)}^7) vs ^7{p2.clean_name} ^7(^5{int(p2.rating)}^7)"')
             return
 
         # 4. DUEL LOGIC (End)
@@ -955,9 +1047,8 @@ class MBIIDuelPlugin:
             try:
                 raw_w, raw_l = m_end.group(1).strip(), m_end.group(2).strip()
                 
-                # SIGNATURE GATE: Kill the process immediately if we've seen this exact kill
                 sig = f"end-{raw_w}-{raw_l}-{line.strip()}"
-                if sig == self.last_duel_end_sig:
+                if sig == getattr(self, 'last_duel_end_sig', None):
                     return
                 self.last_duel_end_sig = sig
 
@@ -966,19 +1057,19 @@ class MBIIDuelPlugin:
 
                 if winner and loser:
                     duel_key = tuple(sorted([winner.clean_name, loser.clean_name]))
-                    
                     if duel_key not in self.active_duels:
                         return
 
                     self.active_duels.discard(duel_key)
                     self.calculate_glicko2(winner, loser)
 
-                    is_formal_match = (winner.pending_invite_from == loser or loser.pending_invite_from == winner)
-
-                    if is_formal_match:
+                    # --- MATCH SCORING ---
+                    # Use the flag to determine if we should increment match_score
+                    if getattr(winner, 'is_formal_match', False) or getattr(loser, 'is_formal_match', False):
                         winner.match_score += 1
-                        limit = getattr(winner, 'pending_limit', 5)
-                        
+                        limit = getattr(winner, 'match_limit', 5)
+
+                        # Update database stats
                         with sqlite3.connect(self.db_filename) as conn:
                             w_f = 'guid' if (winner.guid and len(winner.guid) > 10) else 'clean_name'
                             l_f = 'guid' if (loser.guid and len(loser.guid) > 10) else 'clean_name'
@@ -986,47 +1077,24 @@ class MBIIDuelPlugin:
                             conn.execute(f"UPDATE players SET total_rounds_lost = total_rounds_lost + 1 WHERE {l_f}=?", (loser.guid if 'guid' in l_f else loser.clean_name,))
                             conn.commit()
 
-                        self.save_match_progress(winner, loser)
-                        self.send_rcon(f'say "^5[MATCH] ^2{winner.clean_name} ^7({winner.match_score}/{limit}) vs ^2{loser.clean_name} ^7({loser.match_score}/{limit})" ')
+                        # Announce current progress
+                        self.send_rcon(f'say "^5[MATCH] ^2{winner.clean_name} ^7(^2{winner.match_score}^7/^3{limit}^7) vs ^2{loser.clean_name} ^7(^1{loser.match_score}^7/^3{limit}^7)"')
                         
+                        # Check for Match Finalization
                         if winner.match_score >= limit:
-                            self.finalize_match(winner, loser)
+                            self.send_rcon(f'say "^5[MATCH] ^2{winner.clean_name} ^7wins the Match ^2{winner.match_score} ^7- ^1{loser.match_score}!"')
+                            # RESET EVERYTHING
+                            winner.match_score = loser.match_score = 0
+                            winner.is_formal_match = loser.is_formal_match = False
                             winner.opponent = loser.opponent = None
-                            winner.pending_invite_from = loser.pending_invite_from = None
                     else:
+                        # Standard Private Duel logic
                         winner.opponent = loser.opponent = None
-                        self.send_rcon(f'say "^5[DUEL] ^2{winner.clean_name} ^7wins! ^2{int(winner.rating)} ^7| ^2{loser.clean_name} ^7dropped to ^1{int(loser.rating)}"')
+                        self.send_rcon(f'say "^5[DUEL] ^7{winner.clean_name} ^7wins! ^2{int(winner.rating)} ^7| ^7{loser.clean_name} ^7dropped to ^1{int(loser.rating)}"')
                         
             except Exception as e:
                 print(f"[PARSER ERROR] m_end failed: {e}")
             return
-
-        # 5. KILLS (Standard non-duel kills)
-        elif "Kill: " in line:
-            m = re.search(r'Kill:\s*(\d+)\s+(\d+)\s+(\d+):', line)
-            if m:
-                k_id, v_id, w_id = m.group(1), m.group(2), m.group(3)
-                
-                # SIGNATURE GATE
-                sig = f"kill-{k_id}-{v_id}-{w_id}-{line.strip()}"
-                if sig == getattr(self, 'last_kill_sig', None):
-                    return
-                self.last_kill_sig = sig
-
-                # Look up players
-                killer = self.slot_map.get(int(k_id))
-                victim = self.slot_map.get(int(v_id))
-
-                if killer and victim and killer != victim:
-                    # CROSS-CHECK: If they are in a duel, IGNORE this kill.
-                    # The DuelEnd block will handle the rating change instead.
-                    duel_key = tuple(sorted([killer.clean_name, victim.clean_name]))
-                    if duel_key in self.active_duels:
-                        return # Let DuelEnd handle it
-
-                    # Only process standard kills here (if you want rating for open-world kills)
-                    # self.calculate_glicko2(killer, victim) 
-            return    
 
         # 5. DISCONNECT CLEANUP (Removed 'entered the game')
         elif "ClientDisconnect:" in line:
@@ -1073,40 +1141,48 @@ class MBIIDuelPlugin:
                 # print(f"[DEBUG] Regex FAILED to match SMOD line format.")
                 pass
 
-        # --- GLOBAL CHAT BLOCK ---
+        # --- GLOBAL CHAT BLOCK (Memory-Safe & Unfiltered) ---
         elif "say:" in line.lower():
-            # FIX 1: Bot Filter (Stops bot from reading its own [DUEL] announcements)
-            if any(x in line for x in ["[DUEL]", "[DB]", "[MATCH]"]):
-                return
             try:
-                # 1. Extract raw SID string
+                # 1. Extract Slot ID and Message
+                # Matches the slot number and the content inside the final quotes
                 sid_match = re.search(r'(\d+)[:\s]*say:', line, re.IGNORECASE)
-                msg_match = re.search(r'say:\s*(.*?):\s*"(.*)"', line)
+                msg_match = re.search(r'say:.*?: "(.*)"', line)
                 
                 if sid_match and msg_match:
-                    sid_str = sid_match.group(1)
-                    raw_name = msg_match.group(1)
-                    message = msg_match.group(2).strip()
-
-                    # FIX 2: Safe SID conversion (Prevents 'CB|Rogue' crash)
-                    try:
-                        log_sid = self.update_player_slot(sid_str, raw_name)
-                    except (ValueError, TypeError):
-                        # If regex slips and grabs a name instead of ID, ignore this line
-                        return
-
-                    # 3. Use 'is not None' to allow Slot 0
-                    p = next((x for x in self.players if x.id == log_sid), None)
+                    sid = int(sid_match.group(1))
+                    message = msg_match.group(1).strip()
                     
-                    if p is not None:
-                        p.id = log_sid # Sync mashed ID to clean ID
+                    # 2. FAST LOOKUP: Try the Slot Map first
+                    p = self.slot_map.get(sid)
+                    
+                    # 3. MEMORY RECOVERY: If Slot Map fails, find the REAL object by name
+                    if not p:
+                        # Extract name from the middle of the say line: "sid: say: slot: Name: "msg""
+                        name_match = re.search(r'say:\s*\d+:\s*(.*?):\s*"', line)
+                        if name_match:
+                            raw_name = name_match.group(1)
+                            clean_n = normalize(raw_name)
+                            # Find the persistent object in self.players
+                            p = next((x for x in self.players if x.clean_name == clean_n), None)
+                            
+                            if p:
+                                # Heal the Slot Map
+                                p.id = sid
+                                self.slot_map[sid] = p
+                    
+                    # 4. EXECUTION: Only handle chat for persistent objects
+                    # This ensures flags like is_formal_pending are preserved
+                    if p:
                         self.handle_chat(p, message)
                     else:
-                        # Fallback for sync failures (Ghost Player)
-                        p_temp = Player(log_sid, raw_name, "0")
-                        self.handle_chat(p_temp, message)
+                        # If truly missing from memory, sync so they exist for the next line
+                        self.force_sync_players()
+
             except Exception as e:
-                print(f"[PARSER ERROR] Say line failed: {e}")
+                # pass silently to keep the log parser running
+                pass 
+            return
 
         # --- PRIVATE MESSAGE (TELL) BLOCK ---
         elif "tell:" in line.lower():
@@ -1146,11 +1222,12 @@ class MBIIDuelPlugin:
     def sync_player(self, sid, name, guid):
         valid_guid = guid and guid != "0" and len(guid) > 10
         current_name = name
-        current_clean = normalize(name) # Simplified
+        current_clean = normalize(name)
         
         rating, rd, role, group = 1500, 350, "MEMBER", "DEFAULT"
         clan = self.detect_clan(name)
         
+        # 1. Database Lookup (Same as yours)
         with sqlite3.connect(self.db_filename) as conn:
             cursor = conn.cursor()
             data = None
@@ -1164,34 +1241,34 @@ class MBIIDuelPlugin:
             
             if data:
                 rating, rd, db_clan, role, group = data
-                if valid_guid:
-                    conn.execute("UPDATE players SET guid=? WHERE clean_name=?", (guid, current_clean))
             else:
                 conn.execute("""INSERT OR IGNORE INTO players (guid, name, clean_name, clan_tag, duel_rating, rating_deviation) 
                              VALUES (?, ?, ?, ?, ?, ?)""", 
                              (guid if valid_guid else f"TEMP_{current_clean}", current_name, current_clean, clan, rating, rd))
             conn.commit()
 
+        # 2. Memory Management - Find by Name
         existing_p = next((p for p in self.players if p.clean_name == current_clean), None)
 
         if existing_p:
-            # Update the existing object so we don't lose duel state/opponents
+            # IMPORTANT: Update ID and stats but DON'T touch Match Flags
             existing_p.id = sid
             existing_p.rating = rating
             existing_p.rd = rd
-            # If the ID changed (player moved slots), update the slot map
             if sid != -1:
                 self.slot_map[sid] = existing_p
             return existing_p
 
-        # 2. If they DON'T exist, only then do we create a new one
+        # 3. New Player logic - Only clear the slot if the NAMES don't match
         if sid != -1:
-            # Clean out the slot if someone else was in it
-            self.players = [p for p in self.players if p.id != sid]
+            # If someone else is in this slot, remove ONLY them
+            self.players = [p for p in self.players if p.id != sid or p.clean_name == current_clean]
         
         new_player = Player(sid, name, guid, rating, rd, clan=clan, role=role, group=group)
-        self.players.append(new_player)
+        # Initialize flags on new player just in case
+        new_player.is_formal_pending = False 
         
+        self.players.append(new_player)
         if sid != -1:
             self.slot_map[sid] = new_player
             
