@@ -759,26 +759,19 @@ class MBIIDuelPlugin:
         elif cmd[0] == "!dforfeit" and p.opponent and not self.active_tournament:
             winner = p.opponent
             
-            # 1. PROCESS RATINGS (Treat as a win for the opponent)
-            # This ensures the winner gets points and the quitter loses points
-            self.calculate_glicko2(winner, p)
-            
-            # 2. CLEAR PERSISTENT DB DATA
+            # 1. Clear persistent DB data (Your existing logic)
             with sqlite3.connect(self.db_filename) as conn:
                 conn.execute("DELETE FROM active_matches WHERE (p1_guid=? AND p2_guid=?) OR (p1_guid=? AND p2_guid=?)",
                              (p.guid, winner.guid, winner.guid, p.guid))
                 conn.commit()
 
-            # 3. RESET MATCH STATE
-            # Important: Clear flags so their next duel isn't accidentally a "Match"
+            # 2. Reset Match State (Crucial for your new system)
             p.match_score = winner.match_score = 0
             p.is_formal_match = winner.is_formal_match = False
             
-            # 4. ANNOUNCE
+            # 3. Announce and break the link
             self.send_rcon(f'say "^5[MATCH] ^2{p.clean_name} ^7forfeited. ^2{winner.clean_name} ^7wins the set!"')
-            self.send_rcon(f'say "^5[DUEL] ^2{winner.clean_name} ^7rating: ^2{int(winner.rating)} ^7| ^2{p.clean_name} ^7rating: ^1{int(p.rating)}"')
             
-            # 5. BREAK THE LINK
             p.opponent = winner.opponent = None
 
         elif cmd[0] == "!dtop":
