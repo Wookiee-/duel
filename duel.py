@@ -65,6 +65,7 @@ class MBIIDuelPlugin:
         self.last_kill_sig = ""
         self.last_duel_start_sig = ""
         self.last_duel_end_sig = ""
+        self.pending_disbands = {}
 
         threading.Timer(2.0, self.force_sync_players).start()
 
@@ -143,7 +144,8 @@ class MBIIDuelPlugin:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             cursor = conn.cursor()
-            # 1. Create the players table with all necessary columns
+            
+            # 1. Create the players table
             cursor.execute('''CREATE TABLE IF NOT EXISTS players (
                     guid TEXT PRIMARY KEY, 
                     name TEXT, 
@@ -155,10 +157,14 @@ class MBIIDuelPlugin:
                     rating_deviation REAL DEFAULT 350,
                     total_rounds_won INTEGER DEFAULT 0, 
                     total_rounds_lost INTEGER DEFAULT 0,
-                    tournament_wins INTEGER DEFAULT 0)''')
+                    tournament_wins INTEGER DEFAULT 0,
+                    matches_won INTEGER DEFAULT 0)''')
             
-            # 2. Index clean_name to make Slot 0 lookups instant
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_clean_name ON players(clean_name)')
+            # 2. Create the persistent clan_locks table
+            cursor.execute('''CREATE TABLE IF NOT EXISTS clan_locks (
+                    clan_tag TEXT, 
+                    group_name TEXT,
+                    UNIQUE(clan_tag, group_name))''')
             
             # 3. Create active_matches for persistence
             cursor.execute('''CREATE TABLE IF NOT EXISTS active_matches (
@@ -169,24 +175,30 @@ class MBIIDuelPlugin:
                     win_limit INTEGER, 
                     is_cvc INTEGER)''')
             
+            # 4. Index clean_name for instant lookups
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_clean_name ON players(clean_name)')
             conn.commit()
 
-        # 4. Migration Block: Ensure all stats columns exist
+        # 5. MIGRATION BLOCK: Ensure all specific columns exist in old databases
         with sqlite3.connect(self.db_filename) as conn:
             columns_to_add = [
                 ("total_rounds_won", "INTEGER DEFAULT 0"),
                 ("total_rounds_lost", "INTEGER DEFAULT 0"),
-                ("tournament_wins", "INTEGER DEFAULT 0")
+                ("tournament_wins", "INTEGER DEFAULT 0"),
+                ("matches_won", "INTEGER DEFAULT 0"),
+                ("clan_tag", "TEXT DEFAULT 'NONE'"),
+                ("clan_role", "TEXT DEFAULT 'MEMBER'"),
+                ("clan_group", "TEXT DEFAULT 'DEFAULT'")
             ]
             for col_name, col_type in columns_to_add:
                 try:
                     conn.execute(f"ALTER TABLE players ADD COLUMN {col_name} {col_type}")
                     conn.commit()
                 except sqlite3.OperationalError:
-                    pass # Column exists 
+                    pass # Column already exists
                     
+        # 6. DATA CLEANUP: Remove duplicate 1500 entries
         with sqlite3.connect(self.db_filename) as conn:
-            # This deletes any "junk" 1500 entries if a higher rating entry exists for the same name
             conn.execute("""
                 DELETE FROM players 
                 WHERE duel_rating = 1500 
@@ -195,7 +207,18 @@ class MBIIDuelPlugin:
                 )
             """)
             conn.commit()
-            print("[SYSTEM] Cleaned up duplicate 1500-rating entries.")             
+            print("[SYSTEM] Database initialized and optimized.")
+
+        # 7. LOAD CLAN LOCKS INTO MEMORY
+        # This populates your self.locked_groups dict so the join logic works immediately
+        self.locked_groups = {}
+        with sqlite3.connect(self.db_filename) as conn:
+            cursor = conn.execute("SELECT clan_tag, group_name FROM clan_locks")
+            for row in cursor.fetchall():
+                tag, grp = row
+                if tag not in self.locked_groups:
+                    self.locked_groups[tag] = []
+                self.locked_groups[tag].append(grp)            
 
     def load_config(self):
         config = configparser.ConfigParser()
@@ -213,10 +236,6 @@ class MBIIDuelPlugin:
     def restore_match_progress(self):
         """Called at startup to see if we were in the middle of a match."""
         pass # Logic handled during player sync to re-link opponents
-
-    def detect_clan(self, name):
-        match = re.search(r'^[\[<\(](.*?)[\]>\)]|^(.*?)\s?\|', normalize(name))
-        return match.group(1).strip().upper() if match and match.group(1) else "NONE"
 
     def handle_spec_reset(self, player):
         # Find if this player is in an active duel
@@ -444,18 +463,13 @@ class MBIIDuelPlugin:
             self.send_rcon(f'say "^5[DUEL] ^2{p.name} ^7is ready to resume!"')
         
         if cmd[0] == "!dhelp":
-            # Line 1: Stats & Ranking
             self.send_rcon(f'svtell {p.id} "^5Stats: ^7!rank [name], !dtop, !fttop, !ttop, !dclantop"')
-            
-            # Line 2: Dueling
             self.send_rcon(f'svtell {p.id} "^5Duel: ^7!dduel <name> <rounds>, !dyes, !dno, !dforfeit, !dpause, !dresume"')
+            # Added "ownership" to the Clan line
+            self.send_rcon(f'svtell {p.id} "^5Clan: ^7!dclantag register <tag>, !dclan show, !dclan ownership, !dclan quit"')
             
-            # Line 3: Clan
-            self.send_rcon(f'svtell {p.id} "^5Clan: ^7!dclantag register <tag>, !dclan show, !dclan join group <name>, !dclan quit"')
-            
-            # Line 4: Staff Only
             if p.role != "MEMBER":
-                self.send_rcon(f'svtell {p.id} "^3Staff: ^7!tstart, !dclan promote/kick/rename/lock/disband, !daccept/!ddecline"')
+                self.send_rcon(f'svtell {p.id} "^3Staff: ^7!tstart, !dclan promote/kick/rename/lock, !dclandisband"')
 
         if cmd[0] == "!dclantag":
             if len(cmd) < 3:
@@ -530,23 +544,63 @@ class MBIIDuelPlugin:
         if cmd[0] == "!dclan" and len(cmd) >= 2:
             sub = cmd[1]
             if sub == "show":
+                if p.clan_tag == "NONE":
+                    self.send_rcon(f'svtell {p.id} "^1Error: ^7You are not in a clan."')
+                    return
                 with sqlite3.connect(self.db_filename) as conn:
                     cursor = conn.cursor()
-                    cursor.execute("SELECT name, clan_role, clan_group FROM players WHERE clan_tag=? AND clan_tag!='NONE'", (p.clan_tag,))
-                    members = [f"{r[0]} ({r[1]} - {r[2]})" for r in cursor.fetchall()]
+                    cursor.execute("SELECT name, clan_role, clan_group FROM players WHERE clan_tag=?", (p.clan_tag,))
+                    results = cursor.fetchall()
+                    members = [f"{r[0]} ({r[1]}-{r[2]})" for r in results]
                     self.send_rcon(f'svtell {p.id} "^5[{p.clan_tag} ROSTER]: ^7{", ".join(members)}"')
             
             elif sub == "promote" and p.role in ["LEADER", "OWNER"]:
                 if len(cmd) < 3: return
                 target_search = cmd[2].lower()
                 target_p = next((x for x in self.players if target_search in x.clean_name and x.clan_tag == p.clan_tag), None)
+                
                 if target_p:
-                    new_role = "LEADER" if p.role == "OWNER" else "OFFICER"
+                    # Determine new role
+                    if target_p.role == "MEMBER": new_role = "OFFICER"
+                    elif target_p.role == "OFFICER": new_role = "LEADER"
+                    else: return # Cannot promote further
+                    
                     target_p.role = new_role
                     with sqlite3.connect(self.db_filename) as conn:
                         conn.execute("UPDATE players SET clan_role=? WHERE guid=?", (new_role, target_p.guid))
                         conn.commit()
                     self.send_rcon(f'say "^5[CLAN] ^2{p.name} ^7promoted ^2{target_p.name} ^7to ^5{new_role}^7!"')
+
+            elif sub == "demote" and p.role in ["LEADER", "OWNER"]:
+                if len(cmd) < 3: return
+                target_search = cmd[2].lower()
+                target_p = next((x for x in self.players if target_search in x.clean_name and x.clan_tag == p.clan_tag), None)
+                
+                if target_p:
+                    # 1. Permission Check: Cannot demote the Owner or yourself
+                    if target_p.role == "OWNER" or target_p == p:
+                        self.send_rcon(f'svtell {p.id} "^1Error: ^7You cannot demote this person."')
+                        return
+
+                    # 2. Permission Check: Officers/Leaders shouldn't demote people higher or equal to them
+                    # (Though your 'if' statement already filters for LEADER/OWNER)
+                    
+                    # 3. Determine new role
+                    if target_p.role == "LEADER":
+                        new_role = "OFFICER"
+                    elif target_p.role == "OFFICER":
+                        new_role = "MEMBER"
+                    else:
+                        self.send_rcon(f'svtell {p.id} "^1Error: ^2{target_p.name} ^7is already at the lowest rank."')
+                        return
+                    
+                    # 4. Apply Changes
+                    target_p.role = new_role
+                    with sqlite3.connect(self.db_filename) as conn:
+                        conn.execute("UPDATE players SET clan_role=? WHERE guid=?", (new_role, target_p.guid))
+                        conn.commit()
+                        
+                    self.send_rcon(f'say "^5[CLAN] ^2{p.name} ^7demoted ^2{target_p.name} ^7to ^5{new_role}^7."')        
 
             elif sub == "rename" and p.role in ["LEADER", "OWNER"]:
                 if len(cmd) < 4: return
@@ -562,8 +616,13 @@ class MBIIDuelPlugin:
             elif sub == "group" and p.role in ["LEADER", "OWNER"]:
                 if len(cmd) < 4: return
                 target_search, group_name = cmd[2].lower(), cmd[3].upper()
-                target_p = next((x for x in self.players if target_search in x.clean_name), None)
-                if target_p and target_p.clan_tag == p.clan_tag:
+                target_p = next((x for x in self.players if target_search in x.clean_name and x.clan_tag == p.clan_tag), None)
+
+                if p.clan_group == group_name:
+                    self.send_rcon(f'svtell {p.id} "^1Error: ^7You are already in ^3{group_name}^7."')
+                    return
+                
+                if target_p:
                     target_p.clan_group = group_name
                     with sqlite3.connect(self.db_filename) as conn:
                         conn.execute("UPDATE players SET clan_group=? WHERE guid=?", (group_name, target_p.guid))
@@ -571,29 +630,61 @@ class MBIIDuelPlugin:
                     self.send_rcon(f'say "^5[CLAN] ^2{target_p.name} ^7moved to subdivision: ^3{group_name}"')
 
             elif sub == "kick" and p.role in ["LEADER", "OWNER"]:
-                target_name = cmd[2].lower()
+                if len(cmd) < 3: return
+                target_search = cmd[2].lower()
+                
+                # Check online players first to wipe their active session
+                target_p = next((x for x in self.players if target_search in x.clean_name and x.clan_tag == p.clan_tag), None)
+                
                 with sqlite3.connect(self.db_filename) as conn:
-                    conn.execute("UPDATE players SET clan_tag='NONE', clan_role='MEMBER', clan_group='DEFAULT' WHERE clean_name=? AND clan_tag=?", (target_name, p.clan_tag))
+                    if target_p:
+                        # Clear live session
+                        target_p.clan_tag = "NONE"
+                        target_p.role = "MEMBER"
+                        target_p.clan_group = "DEFAULT"
+                        conn.execute("UPDATE players SET clan_tag='NONE', clan_role='MEMBER', clan_group='DEFAULT' WHERE guid=?", (target_p.guid,))
+                        self.send_rcon(f'say "^5[CLAN] ^2{p.name} ^7kicked ^1{target_p.name} ^7from clan."')
+                    else:
+                        # Fallback: Try to kick from DB by clean_name if they are offline
+                        conn.execute("UPDATE players SET clan_tag='NONE', clan_role='MEMBER', clan_group='DEFAULT' WHERE clean_name=? AND clan_tag=?", (target_search, p.clan_tag))
+                        self.send_rcon(f'say "^5[CLAN] ^2{p.name} ^7kicked ^1{target_search} ^7from clan (Offline)."')
                     conn.commit()
-                self.send_rcon(f'say "^5[CLAN] ^2{p.name} ^7kicked ^1{target_name} ^7from clan."')
 
             elif sub == "quit":
-                p.clan_tag, p.role, p.clan_group = "NONE", "MEMBER", "DEFAULT"
+                if p.clan_tag == "NONE":
+                    self.send_rcon(f'svtell {p.id} "^1Error: ^7You are not in a clan."')
+                    return
+
+                old_tag = p.clan_tag
+                
+                # 1. Wipe from memory
+                p.clan_tag = "NONE"
+                p.role = "MEMBER"
+                p.clan_group = "DEFAULT"
+
+                # 2. Wipe from Database
                 with sqlite3.connect(self.db_filename) as conn:
                     conn.execute("UPDATE players SET clan_tag='NONE', clan_role='MEMBER', clan_group='DEFAULT' WHERE guid=?", (p.guid,))
                     conn.commit()
-                self.send_rcon(f'say "^5[CLAN] ^2{p.name} ^7has left their clan."')
+
+                self.send_rcon(f'say "^5[CLAN] ^2{p.clean_name} ^7has left the clan ^5{old_tag}^7."')
+                return
 
             elif sub == "lock" and p.role in ["LEADER", "OWNER"]:
                 if len(cmd) < 3: return
                 group_name = cmd[2].upper()
                 clan_locks = self.locked_groups.get(p.clan_tag, [])
-                if group_name in clan_locks:
-                    clan_locks.remove(group_name)
-                    self.send_rcon(f'say "^5[CLAN] ^3{group_name} ^7is now ^2OPEN^7."')
-                else:
-                    clan_locks.append(group_name)
-                    self.send_rcon(f'say "^5[CLAN] ^3{group_name} ^7is now ^1LOCKED ^7(Invite Only)."')
+                
+                with sqlite3.connect(self.db_filename) as conn:
+                    if group_name in clan_locks:
+                        clan_locks.remove(group_name)
+                        conn.execute("DELETE FROM clan_locks WHERE clan_tag=? AND group_name=?", (p.clan_tag, group_name))
+                        self.send_rcon(f'say "^5[CLAN] ^3{group_name} ^7is now ^2OPEN^7."')
+                    else:
+                        clan_locks.append(group_name)
+                        conn.execute("INSERT INTO clan_locks (clan_tag, group_name) VALUES (?, ?)", (p.clan_tag, group_name))
+                        self.send_rcon(f'say "^5[CLAN] ^3{group_name} ^7is now ^1LOCKED ^7(Invite Only)."')
+                
                 self.locked_groups[p.clan_tag] = clan_locks
 
             elif sub == "join" and len(cmd) >= 3 and cmd[2] == "group":
@@ -611,10 +702,29 @@ class MBIIDuelPlugin:
                         conn.execute("UPDATE players SET clan_group=? WHERE guid=?", (group_name, p.guid))
                     self.send_rcon(f'svtell {p.id} "^5[CLAN] ^7Joined group ^3{group_name}"')
 
+            elif sub == "ownership" and p.role == "OWNER":
+                if len(cmd) < 3: return
+                target_search = cmd[2].lower()
+                target_p = next((x for x in self.players if target_search in x.clean_name and x.clan_tag == p.clan_tag), None)
+                
+                if target_p:
+                    # Transfer ownership
+                    with sqlite3.connect(self.db_filename) as conn:
+                        conn.execute("UPDATE players SET clan_role='LEADER' WHERE guid=?", (p.guid,))
+                        conn.execute("UPDATE players SET clan_role='OWNER' WHERE guid=?", (target_p.guid,))
+                        conn.commit()
+                    
+                    p.role = "LEADER"
+                    target_p.role = "OWNER"
+                    self.send_rcon(f'say "^5[CLAN] ^2{p.name} ^7has transferred Clan Ownership to ^5{target_p.name}^7!"')        
+
         elif cmd[0] == "!daccept" and p.role in ["LEADER", "OWNER"]:
-            if len(cmd) < 2: return
-            target_p = next((x for x in self.players if x.id == int(cmd[1])), None)
-            if target_p and target_p.pending_group_request and target_p.clan_tag == p.clan_tag:
+            if len(cmd) < 2 or not cmd[1].isdigit(): return
+            target_id = int(cmd[1])
+            target_p = next((x for x in self.players if x.id == target_id), None)
+            
+            # Ensure target is actually requesting to join THIS clan's group
+            if target_p and getattr(target_p, 'pending_group_request', None) and target_p.clan_tag == p.clan_tag:
                 group = target_p.pending_group_request
                 target_p.clan_group = group
                 target_p.pending_group_request = None
@@ -687,15 +797,6 @@ class MBIIDuelPlugin:
 
             self.send_rcon(f'say "^5[FORFEIT] ^2{p.name} ^7surrendered to ^2{winner.name}^7."')
             self.finalize_match(winner, p)
-
-        elif cmd[0] == "!dlist":
-            # Filter for players who actually have a valid slot ID
-            online = [f"{x.clean_name}({x.id})" for x in self.players if x.id != -1]
-            if not online:
-                self.send_rcon(f'svtell {p.id} "^1Error: ^7Memory is empty. Try joining a team."')
-            else:
-                out = " ^7| ^2".join(online)
-                self.send_rcon(f'svtell {p.id} "^5[DEBUG] ^7Memory: ^2{out}"')  
 
         elif cmd[0] == "!dduel":
             if len(cmd) < 3:
@@ -777,24 +878,20 @@ class MBIIDuelPlugin:
         elif cmd[0] == "!dtop":
             self.show_leaderboard("duel_rating", "Duel Ratings (Glicko-2)", p.id)
         elif cmd[0] == "!fttop":
-            self.show_leaderboard("total_rounds_won", "Total Rounds Won", p.id)
+            self.show_leaderboard("matches_won", "Match Sets Won", p.id)
         elif cmd[0] == "!ttop":
             self.show_leaderboard("tournament_wins", "Tournament Wins", p.id)
         elif cmd[0] == "!dclantop":
-            self.show_clan_leaderboard(p.id)
-        elif cmd[0] == "!sync":
-            self.force_sync_players()
-            self.send_rcon(f'svtell {p.id} "^5[SYSTEM] ^7Memory refreshed. {len(self.players)} players synced."')    
+            self.show_clan_leaderboard(p.id)  
 
     def show_leaderboard(self, column, label, sid):
         with sqlite3.connect(self.db_filename) as conn:
             cursor = conn.cursor()
-            # REMOVED: guid != '0'
-            # ADDED: duel_rating > 1500 (optional, to hide unranked)
+            # Added "AND {column} > 0" so unranked/0-win players don't clutter the top list
             cursor.execute(f"""
                 SELECT name, {column} 
                 FROM players 
-                WHERE name != 'Unknown' AND name != ''
+                WHERE name != 'Unknown' AND name != '' AND {column} > 0
                 ORDER BY {column} DESC LIMIT 5
             """)
             rows = cursor.fetchall()
@@ -805,6 +902,7 @@ class MBIIDuelPlugin:
                 return
 
             for i, (name, val) in enumerate(rows, 1):
+                # Using int(val) is safe for ratings, wins, and match counts
                 self.send_rcon(f'svtell {sid} "^7{i}. ^2{name} ^7- ^3{int(val)}"')
 
     def show_clan_leaderboard(self, sid):
@@ -1015,23 +1113,18 @@ class MBIIDuelPlugin:
                 
                 self.active_duels.add(duel_key)
 
-                # --- MATCH DETECTION ---
-                limit = 5
-                tag = "^5[DUEL]"
-                
-                # Check the flag set by !dyes
-                if getattr(p1, 'is_formal_match', False) or getattr(p2, 'is_formal_match', False):
-                    limit = getattr(p1, 'match_limit', getattr(p2, 'match_limit', 5))
-                    tag = "^5[MATCH]"
-                    # We do NOT reset is_formal_match here so that Round 2, 3, etc. still show [MATCH]
-
                 # Link opponents for the scoring block
                 p1.opponent, p2.opponent = p2, p1
-                
-                if tag == "^5[MATCH]":
-                    self.send_rcon(f'say "{tag} ^2{p1.clean_name} ^7vs ^2{p2.clean_name} ^7- First to ^3{limit} ^7starts NOW!"')
+
+                # --- DYNAMIC MATCH DETECTION ---
+                if getattr(p1, 'is_formal_match', False) or getattr(p2, 'is_formal_match', False):
+                    # Pull the dynamic limit (e.g., 2)
+                    limit = getattr(p1, 'match_limit', getattr(p2, 'match_limit', 5))
+                    # Show the current score (0/2 vs 0/2 on round 1, etc)
+                    self.send_rcon(f'say "^5[MATCH] ^7Round Start: ^2{p1.clean_name} ^7(^2{p1.match_score}^7/^3{limit}^7) vs ^2{p2.clean_name} ^7(^2{p2.match_score}^7/^3{limit}^7)"')
                 else:
-                    self.send_rcon(f'say "{tag} ^7Challenge: ^7{p1.clean_name} ^7(^5{int(p1.rating)}^7) vs ^7{p2.clean_name} ^7(^5{int(p2.rating)}^7)"')
+                    # Standard Private Duel
+                    self.send_rcon(f'say "^5[DUEL] ^7Challenge: ^7{p1.clean_name} ^7(^5{int(p1.rating)}^7) vs ^7{p2.clean_name} ^7(^5{int(p2.rating)}^7)"')
             return
 
         # 4. DUEL LOGIC (End)
@@ -1040,6 +1133,7 @@ class MBIIDuelPlugin:
             try:
                 raw_w, raw_l = m_end.group(1).strip(), m_end.group(2).strip()
                 
+                # Signature check to prevent double-processing
                 sig = f"end-{raw_w}-{raw_l}-{line.strip()}"
                 if sig == getattr(self, 'last_duel_end_sig', None):
                     return
@@ -1053,47 +1147,60 @@ class MBIIDuelPlugin:
                     if duel_key not in self.active_duels:
                         return
 
+                    # Unlock the duel gate
                     self.active_duels.discard(duel_key)
+                    
+                    # Calculate Rating Change (Glicko/Elo)
                     self.calculate_glicko2(winner, loser)
 
-                    # --- MATCH SCORING ---
-                    # Use the flag to determine if we should increment match_score
+                    # --- DYNAMIC MATCH SCORING ---
                     if getattr(winner, 'is_formal_match', False) or getattr(loser, 'is_formal_match', False):
                         winner.match_score += 1
                         limit = getattr(winner, 'match_limit', 5)
 
-                        # Update database stats
+                        # Single DB connection for efficiency
                         with sqlite3.connect(self.db_filename) as conn:
                             w_f = 'guid' if (winner.guid and len(winner.guid) > 10) else 'clean_name'
                             l_f = 'guid' if (loser.guid and len(loser.guid) > 10) else 'clean_name'
+                            
+                            # 1. Update individual round stats
                             conn.execute(f"UPDATE players SET total_rounds_won = total_rounds_won + 1 WHERE {w_f}=?", (winner.guid if 'guid' in w_f else winner.clean_name,))
                             conn.execute(f"UPDATE players SET total_rounds_lost = total_rounds_lost + 1 WHERE {l_f}=?", (loser.guid if 'guid' in l_f else loser.clean_name,))
-                            conn.commit()
 
-                        # Announce current progress
-                        self.send_rcon(f'say "^5[MATCH] ^2{winner.clean_name} ^7(^2{winner.match_score}^7/^3{limit}^7) vs ^2{loser.clean_name} ^7(^1{loser.match_score}^7/^3{limit}^7)"')
-                        
-                        # Check for Match Finalization
-                        if winner.match_score >= limit:
-                            self.send_rcon(f'say "^5[MATCH] ^2{winner.clean_name} ^7wins the Match ^2{winner.match_score} ^7- ^1{loser.match_score}!"')
-                            # RESET EVERYTHING
-                            winner.match_score = loser.match_score = 0
-                            winner.is_formal_match = loser.is_formal_match = False
-                            winner.opponent = loser.opponent = None
+                            # 2. Announce round results
+                            self.send_rcon(f'say "^5[MATCH] ^2{winner.clean_name} ^7(^2{winner.match_score}^7/^3{limit}^7) vs ^2{loser.clean_name} ^7(^1{loser.match_score}^7/^3{limit}^7)"')
+                            
+                            # 3. Check for Match Finalization (The Series Win)
+                            if winner.match_score >= limit:
+                                self.send_rcon(f'say "^5[MATCH] ^2{winner.clean_name} ^7wins the Match ^2{winner.match_score} ^7- ^1{loser.match_score}!"')
+                                
+                                # Increment the !fttop counter
+                                conn.execute(f"UPDATE players SET matches_won = matches_won + 1 WHERE {w_f}=?", (winner.guid if 'guid' in w_f else winner.clean_name,))
+                                
+                                # Reset match state
+                                winner.match_score = 0
+                                loser.match_score = 0
+                                winner.is_formal_match = False
+                                loser.is_formal_match = False
+                                winner.opponent = None
+                                loser.opponent = None
+                            
+                            conn.commit()
                     else:
-                        # Standard Private Duel logic
-                        winner.opponent = loser.opponent = None
+                        # Standard Private Duel logic (Non-formal)
+                        winner.opponent = None
+                        loser.opponent = None
                         self.send_rcon(f'say "^5[DUEL] ^7{winner.clean_name} ^7wins! ^2{int(winner.rating)} ^7| ^7{loser.clean_name} ^7dropped to ^1{int(loser.rating)}"')
                         
             except Exception as e:
                 print(f"[PARSER ERROR] m_end failed: {e}")
             return
 
-        # 5. DISCONNECT CLEANUP (Removed 'entered the game')
+        # 5. DISCONNECT CLEANUP
         elif "ClientDisconnect:" in line:
             m = re.search(r'ClientDisconnect:\s*(\d+)', line)
             if m:
-                t_sid = int(m.group(1)) # Group 1 because the regex is now simpler
+                t_sid = int(m.group(1))
                 t_p = next((x for x in self.players if x.id == t_sid), None)
                 
                 if t_p:
@@ -1101,16 +1208,19 @@ class MBIIDuelPlugin:
                     if t_p.opponent:
                         opp = t_p.opponent
                         self.send_rcon(f'say "^5[MATCH] ^2{opp.name} ^7wins! ^2{t_p.name} ^7left the server."')
+                        
+                        # Full Reset for the opponent who stayed
                         opp.opponent = None
                         opp.match_score = 0
+                        opp.is_formal_match = False # Reset the match flag
+                        opp.match_limit = 5         # Reset limit to default
 
                     # --- CLEAR ACTIVE DUEL GATE ---
-                    # Use a set comprehension to filter out the leaving player's name
+                    # Ensures the duel key is removed so the opponent can duel again immediately
                     self.active_duels = {key for key in self.active_duels if t_p.clean_name not in key}
                     
                     # --- SESSION REMOVAL ---
-                    # This ensures that if they rejoin, sync_player creates a fresh object
-                    self.players = [p for p in self.players if p.id != t_sid]  
+                    self.players = [p for p in self.players if p.id != t_sid]
 
         # --- SMOD ADMIN PARSER ---
         if "SMOD smsay:" in line:
@@ -1218,7 +1328,7 @@ class MBIIDuelPlugin:
         current_clean = normalize(name)
         
         rating, rd, role, group = 1500, 350, "MEMBER", "DEFAULT"
-        clan = self.detect_clan(name)
+        clan = "NONE"
         
         # 1. Database Lookup (Same as yours)
         with sqlite3.connect(self.db_filename) as conn:
