@@ -8,18 +8,22 @@ import sqlite3
 import math
 import threading
 
-def normalize(text):
-    if not text: return ""
-    # Remove colors (^1, ^2, etc)
-    clean = re.sub(r'\^.', '', text)
-    # Lowercase, strip spaces, and remove brackets to match the Player class
-    return clean.lower().strip().replace('[', '').replace(']', '') 
+def normalize(name):
+    if not name: return ""
+    # 1. Strip color codes (^1, ^2, etc.)
+    name = re.sub(r'\^.', '', name) 
+    # 2. Lowercase
+    name = name.lower().strip()
+    # 3. Remove all non-alphanumeric (removes {}, [], _, |, etc.)
+    # This ensures "Cheemsune Miku" matches the messy log version
+    name = re.sub(r'[^a-z0-9]', '', name)
+    return name
 
 class Player:
     def __init__(self, sid, name, guid, rating=1500, rd=350, vol=0.06, clan="NONE", role="MEMBER", group="DEFAULT"):
         self.id = sid
         self.name = name
-        self.clean_name = re.sub(r'\^.', '', name).lower().strip().replace('[', '').replace(']', '')
+        self.clean_name = normalize(name)
         self.guid = guid
         self.rating = rating
         self.rd = rd
@@ -74,26 +78,32 @@ class MBIIDuelPlugin:
         self.restore_match_progress()
 
     def force_sync_players(self):
-        # 1. Get the raw text from the status command
         status_data = self.send_rcon("status") 
         if not status_data:
             return
 
-        # 2. Parse the status response line by line
+        # Matches Slot (Group 1) and Name (Group 2) by looking for the IP address as the end marker
+        player_pattern = re.compile(r'^\s*(\d+)\s+-?\d+\s+\d+\s+(.*?)\s+(?:\d{1,3}\.){3}\d{1,3}')
+
+        found_count = 0
         for line in status_data.split('\n'):
-            parts = line.split()
-            # Most MBII status lines start with the slot ID (0-31)
-            if len(parts) >= 4 and parts[0].isdigit():
-                slot_id = int(parts[0])
-                raw_name = parts[3] 
+            match = player_pattern.search(line)
+            if match:
+                slot_id = int(match.group(1))
+                # 1. Grab the name
+                raw_name = match.group(2).strip() 
                 
-                # 3. Use your sync_player logic to re-populate memory
+                # 2. Clean trailing color codes (like that ^7 at the end of Valzhar)
+                raw_name = re.sub(r'\^.$', '', raw_name).strip()
+                
                 p = self.sync_player(slot_id, raw_name, "0")
-                
-                # 4. Save to your freshly cleared memory
-                self.slot_map[slot_id] = p
-                if p not in self.players:
-                    self.players.append(p)
+                if p:
+                    self.slot_map[slot_id] = p
+                    if p not in self.players:
+                        self.players.append(p)
+                    found_count += 1
+        
+        print(f"[SYSTEM] Sync complete. Memory: {len(self.players)} (Found {found_count} in status)")
 
     def start_status_loop(self):
         def loop():
@@ -1045,7 +1055,9 @@ class MBIIDuelPlugin:
             
             self.players = [] 
             self.slot_map = {} 
-            
+
+            self.force_sync_players()
+
             threading.Timer(2.0, self.force_sync_players).start()
             
             return True
@@ -1244,83 +1256,65 @@ class MBIIDuelPlugin:
                 # print(f"[DEBUG] Regex FAILED to match SMOD line format.")
                 pass
 
-        # --- GLOBAL CHAT BLOCK (Memory-Safe & Unfiltered) ---
-        elif "say:" in line.lower():
+        # --- UNIFIED CHAT BLOCK (SAY & TELL) ---
+        elif "say:" in line.lower() or "tell:" in line.lower():
+            if "say: server:" in line.lower() or "say: console:" in line.lower():
+                return
+
+            p = None 
+            log_sid = -1
+            message = ""
+
             try:
-                # 1. Extract Slot ID and Message
-                # Matches the slot number and the content inside the final quotes
-                sid_match = re.search(r'(\d+)[:\s]*say:', line, re.IGNORECASE)
-                msg_match = re.search(r'say:.*?: "(.*)"', line)
-                
-                if sid_match and msg_match:
-                    sid = int(sid_match.group(1))
+                # 1. Capture SID accurately (the digits right before : say:)
+                sid_match = re.search(r'(\d+):\s*(?:say|tell):', line, re.IGNORECASE)
+                if sid_match:
+                    log_sid = int(sid_match.group(1))
+                    p = self.slot_map.get(log_sid)
+
+                # 2. Extract Message
+                msg_match = re.search(r':\s*"(.*)"\s*$', line)
+                if msg_match:
                     message = msg_match.group(1).strip()
-                    
-                    # 2. FAST LOOKUP: Try the Slot Map first
-                    p = self.slot_map.get(sid)
-                    
-                    # 3. MEMORY RECOVERY: If Slot Map fails, find the REAL object by name
-                    if not p:
-                        # Extract name from the middle of the say line: "sid: say: slot: Name: "msg""
-                        name_match = re.search(r'say:\s*\d+:\s*(.*?):\s*"', line)
-                        if name_match:
-                            raw_name = name_match.group(1)
-                            clean_n = normalize(raw_name)
-                            # Find the persistent object in self.players
-                            p = next((x for x in self.players if x.clean_name == clean_n), None)
-                            
-                            if p:
-                                # Heal the Slot Map
-                                p.id = sid
-                                self.slot_map[sid] = p
-                    
-                    # 4. EXECUTION: Only handle chat for persistent objects
-                    # This ensures flags like is_formal_pending are preserved
-                    if p:
-                        self.handle_chat(p, message)
-                    else:
-                        # If truly missing from memory, sync so they exist for the next line
-                        self.force_sync_players()
+
+                # 3. RECOVERY (The logic that must work)
+                if not p:
+                    # Capture name between 'say:' and the next ':'
+                    name_recovery = re.search(r'(?:say|tell):\s*(.*?)\s*:', line, re.IGNORECASE)
+                    if name_recovery:
+                        raw_name = name_recovery.group(1).strip()
+                        clean_log_name = normalize(raw_name)
+                        
+                        # Loop through your 18 players
+                        for player_obj in self.players:
+                            # Try Exact Match first
+                            if player_obj.clean_name == clean_log_name:
+                                p = player_obj
+                                break
+                            # Try Fuzzy Match (if one is inside the other)
+                            # This fixes cases where a stray symbol survived normalization
+                            elif clean_log_name in player_obj.clean_name or player_obj.clean_name in clean_log_name:
+                                if len(clean_log_name) > 3: # Safety to prevent matching 'a' to 'admin'
+                                    p = player_obj
+                                    break
+                        
+                        if p and log_sid != -1:
+                            print(f"[RECOVERY] Success! {p.clean_name} mapped to Slot {log_sid}")
+                            p.id = log_sid
+                            self.slot_map[log_sid] = p
+
+                # 4. EXECUTION
+                if p and message:
+                    self.handle_chat(p, message)
+                elif "console" not in line.lower() and "server:" not in line.lower():
+                    # This print will now show you the 'Normalized' attempt
+                    failed_raw = line.split('say: ')[-1].split(':')[0] if "say:" in line else "Unknown"
+                    print(f"[PARSER] No match for '{failed_raw}' (Normalized: '{normalize(failed_raw)}'). Count: {len(self.players)}")
+                    self.force_sync_players()
 
             except Exception as e:
-                # pass silently to keep the log parser running
-                pass 
+                print(f"[PARSER ERROR] Chat failed: {e}")
             return
-
-        # --- PRIVATE MESSAGE (TELL) BLOCK ---
-        elif "tell:" in line.lower():
-            try:
-                sid_match = re.search(r'(\d+)\s*tell:', line, re.IGNORECASE)
-                # Captures the sender name and the message
-                msg_match = re.search(r'tell:\s*(.*?)\s+to\s+.*?:\s*"(.*)"', line)
-                
-                if sid_match and msg_match:
-                    sid_str = sid_match.group(1)
-                    raw_sender = msg_match.group(1).strip()
-                    message = msg_match.group(2).strip()
-
-                    # FIX 3: Safe SID conversion for Tells
-                    try:
-                        log_sid = self.update_player_slot(sid_str, raw_sender)
-                    except (ValueError, TypeError):
-                        return
-
-                    p = next((x for x in self.players if x.id == log_sid), None)
-                    
-                    # Safe fallback for Slot 0
-                    if p is None:
-                        clean_n = normalize(raw_sender) # Ensure normalize is available
-                        p = next((x for x in self.players if x.clean_name == clean_n), None)
-
-                    if p is not None:
-                        p.id = log_sid
-                        self.handle_chat(p, message)
-                    else:
-                        p_temp = Player(log_sid, raw_sender, "0")
-                        self.handle_chat(p_temp, message)
-            except Exception as e:
-                print(f"[PARSER ERROR] Tell line failed: {e}")
-
 
     def sync_player(self, sid, name, guid):
         valid_guid = guid and guid != "0" and len(guid) > 10
@@ -1380,16 +1374,21 @@ class MBIIDuelPlugin:
     def send_rcon(self, command):
         try:
             client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            client.settimeout(1.5) # Wait a bit for the server to reply
+            client.settimeout(2.0) # Increased timeout slightly
             packet = b'\xff\xff\xff\xff' + f'rcon "{self.settings["rcon"]}" {command}'.encode()
             client.sendto(packet, (self.settings["ip"], int(self.settings["port"])))
             
-            # If we are asking for 'status', we need to listen for the answer
             if command == "status":
-                data, addr = client.recvfrom(4096)
-                return data.decode('utf-8', errors='ignore')
+                data, addr = client.recvfrom(8192)
+                # Try latin-1 if utf-8 feels 'off' - it's more permissive with symbols
+                response = data.decode('latin-1', errors='ignore')
+                
+                if response.startswith('\xff\xff\xff\xffprint'):
+                    response = response[10:]
+                return response
             
             client.close()
+            return ""
         except Exception as e:
             print(f"RCON Error: {e}")
             return None
